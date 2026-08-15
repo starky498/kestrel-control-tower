@@ -321,8 +321,19 @@ def render_definitions(
                 f"Formula: {definition.formula}  |  Grain: {definition.grain}  |  "
                 f"Date basis: {definition.date_basis}"
             )
+            st.caption(
+                "Allowed dimensions: "
+                + ", ".join(definition.allowed_dimensions)
+                + "  |  Sources: "
+                + ", ".join(definition.source_models)
+            )
+            st.caption("Exclusions: " + "; ".join(definition.exclusions))
             if definition.warning:
                 st.caption(f"Caution: {definition.warning}")
+            st.caption(
+                "Interpretation limits: "
+                + "; ".join(definition.interpretation_limits)
+            )
 
 
 def dataframe_or_empty(
@@ -336,7 +347,11 @@ def dataframe_or_empty(
     if frame.empty:
         render_empty_state(empty_title, empty_body)
         return
-    display = frame.head(max_rows) if max_rows else frame
+    display = (frame.head(max_rows) if max_rows else frame).copy()
+    # Semantic services attach methodology metadata for programmatic consumers. Streamlit
+    # serializes DataFrame attrs along with the table, and date-valued evidence there can emit
+    # noisy Arrow warnings without changing the visible result.
+    display.attrs = {}
     st.dataframe(
         display,
         hide_index=True,

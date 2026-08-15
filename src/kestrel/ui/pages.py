@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -28,6 +29,7 @@ from kestrel.ui.components import (
     RED,
     TEAL,
     MetricCard,
+    Tone,
     comparison_delta,
     dataframe_or_empty,
     format_compact_number,
@@ -82,6 +84,223 @@ def _percent(value: float | None) -> str:
     return "Not available" if value is None else f"{value * 100:.1f}%"
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecutiveExternalSignals:
+    paid_freight_per_case_inr: float | None
+    freight_detail: str
+    freight_lens: str
+    competitor_coverage: float | None
+    competitor_matched: int
+    competitor_listings: int
+    competitor_freshness: str
+    freight_ignored_filters: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+def _source_sync_detail(sync_status: pd.DataFrame, source_name: str) -> str:
+    if sync_status.empty or "source_name" not in sync_status:
+        return "No governed sync metadata"
+    rows = sync_status.loc[sync_status["source_name"] == source_name]
+    if rows.empty:
+        return "No governed sync metadata"
+    row = rows.iloc[0]
+    coverage_end = row.get("coverage_end")
+    completed = pd.to_datetime(row.get("completed_at_utc"), errors="coerce")
+    parts = []
+    if pd.notna(coverage_end):
+        parts.append(f"coverage through {coverage_end}")
+    if pd.notna(completed):
+        parts.append(f"cached {completed.strftime('%d %b %Y')}")
+    if not bool(row.get("is_complete")):
+        parts.append("latest cache incomplete")
+    return " · ".join(parts) or "Sync metadata present"
+
+
+def _summarise_external_frames(
+    freight: pd.DataFrame,
+    match_quality: pd.DataFrame,
+    sync_status: pd.DataFrame,
+    *,
+    freight_lens: str = "warehouse",
+    warnings: tuple[str, ...] = (),
+) -> _ExecutiveExternalSignals:
+    paid_freight = _sum_column(freight, "paid_cost_inr")
+    delivered_cases = _sum_column(freight, "delivered_case_equivalents")
+    paid_freight_per_case = (
+        paid_freight / delivered_cases
+        if paid_freight is not None
+        and delivered_cases is not None
+        and delivered_cases > 0
+        else None
+    )
+    freight_detail = _source_sync_detail(sync_status, "freight_api")
+
+    listings = (
+        int(pd.to_numeric(match_quality["listings"], errors="coerce").fillna(0).sum())
+        if "listings" in match_quality
+        else 0
+    )
+    matched = 0
+    if {"match_status", "listings"}.issubset(match_quality.columns):
+        matched = int(
+            pd.to_numeric(
+                match_quality.loc[
+                    match_quality["match_status"].astype(str).str.casefold() == "matched",
+                    "listings",
+                ],
+                errors="coerce",
+            )
+            .fillna(0)
+            .sum()
+        )
+    coverage = matched / listings if listings else None
+    return _ExecutiveExternalSignals(
+        paid_freight_per_case_inr=paid_freight_per_case,
+        freight_detail=freight_detail,
+        freight_lens=freight_lens,
+        competitor_coverage=coverage,
+        competitor_matched=matched,
+        competitor_listings=listings,
+        competitor_freshness=_source_sync_detail(sync_status, "bazaarpulse"),
+        freight_ignored_filters=tuple(freight.attrs.get("ignored_filters", ())),
+        warnings=warnings,
+    )
+
+
+def _load_executive_external_signals(
+    settings: Settings, context: FilterContext
+) -> _ExecutiveExternalSignals:
+    capability = external_analytics(settings)
+    if not capability.available:
+        return _summarise_external_frames(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            warnings=(capability.message,),
+        )
+    freight_lens = "route" if context.filters.route_codes else "warehouse"
+    freight_method = (
+        "freight_by_route" if freight_lens == "route" else "freight_by_warehouse"
+    )
+    freight_result = call_external(capability.payload, freight_method, context.filters)
+    quality_result = call_external(capability.payload, "competitor_match_quality")
+    sync_result = call_external(capability.payload, "sync_status")
+    warnings = tuple(
+        result.message
+        for result in (freight_result, quality_result, sync_result)
+        if not result.available
+    )
+    freight = (
+        freight_result.payload
+        if freight_result.available and isinstance(freight_result.payload, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    quality = (
+        quality_result.payload
+        if quality_result.available and isinstance(quality_result.payload, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    sync_status = (
+        sync_result.payload
+        if sync_result.available and isinstance(sync_result.payload, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    if freight.empty and freight.attrs.get("unavailable_reason"):
+        warnings = (*warnings, str(freight.attrs["unavailable_reason"]))
+    return _summarise_external_frames(
+        freight,
+        quality,
+        sync_status,
+        freight_lens=freight_lens,
+        warnings=tuple(dict.fromkeys(warnings)),
+    )
+
+
+def _build_executive_inbox(
+    service_summary: Mapping[str, MetricValue],
+    delivery_summary: Mapping[str, MetricValue],
+    external: _ExecutiveExternalSignals,
+    failure_pareto: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+
+    def add(
+        signal: str,
+        metric: MetricValue | None,
+        review_rate: float | None,
+        lens: str,
+    ) -> None:
+        if metric is None or review_rate is None:
+            return
+        rows.append(
+            {
+                "Signal": signal,
+                "Review rate": 100 * review_rate,
+                "Evidence": _metric_detail(metric, "eligible records"),
+                "Lens": lens,
+            }
+        )
+
+    strict = service_summary.get("strict_otif")
+    add(
+        "Strict OTIF gap",
+        strict,
+        1 - strict.value if strict and strict.value is not None else None,
+        "Structural data finding",
+    )
+    delay_conflict = delivery_summary.get("delay_source_conflict_rate")
+    add(
+        "Delay-source disagreement",
+        delay_conflict,
+        delay_conflict.value if delay_conflict else None,
+        "Data trust",
+    )
+    late = delivery_summary.get("delivery_late_over_2h_rate")
+    add(
+        "More than two hours late",
+        late,
+        late.value if late else None,
+        "Delivery exception",
+    )
+    failure = delivery_summary.get("recorded_failure_rate")
+    failure_lens = "Recorded delivery label"
+    if not failure_pareto.empty and "failure_reason_code" in failure_pareto:
+        failure_lens += f" · leading {failure_pareto.iloc[0]['failure_reason_code']}"
+    add(
+        "Recorded failure labels",
+        failure,
+        failure.value if failure else None,
+        failure_lens,
+    )
+    pod = delivery_summary.get("pod_coverage_rate")
+    add(
+        "POD not captured",
+        pod,
+        1 - pod.value if pod and pod.value is not None else None,
+        "Evidence completeness",
+    )
+    if external.competitor_coverage is not None:
+        rows.append(
+            {
+                "Signal": "Competitor listings unmatched",
+                "Review rate": 100 * (1 - external.competitor_coverage),
+                "Evidence": (
+                    f"{external.competitor_listings - external.competitor_matched:,} of "
+                    f"{external.competitor_listings:,} current listings"
+                ),
+                "Lens": "Entity-resolution coverage",
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    frame = frame.sort_values(
+        ["Review rate", "Signal"], ascending=[False, True]
+    ).reset_index(drop=True)
+    frame.insert(0, "Rank", range(1, len(frame) + 1))
+    return frame
+
+
 def _metric_detail(metric: MetricValue | None, noun: str) -> str:
     if metric is None or metric.denominator is None:
         return "No denominator is available for this scope."
@@ -93,6 +312,7 @@ def _metric_detail(metric: MetricValue | None, noun: str) -> str:
 def _previous_summary(
     service: AnalyticsService,
     context: FilterContext,
+    basis: QuantityBasis | None = None,
 ) -> dict[str, MetricValue] | None:
     active_period = Period(
         context.filters.start_date,
@@ -103,7 +323,9 @@ def _previous_summary(
     if prior.end < context.data_min_date:
         return None
     bounded = Period(max(prior.start, context.data_min_date), prior.end, prior.label)
-    return service.executive_summary(with_dates(context.filters, bounded), context.basis)
+    return service.executive_summary(
+        with_dates(context.filters, bounded), basis or context.basis
+    )
 
 
 def _rate_cards(
@@ -189,6 +411,49 @@ def _render_service_trend(frame: pd.DataFrame, *, title: str) -> None:
         color="Metric",
         markers=True,
         color_discrete_map={"Fill rate": TEAL, "On time": NAVY, "Strict OTIF": RED},
+        title=title,
+    )
+    figure.update_yaxes(title="Percent", ticksuffix="%", rangemode="tozero")
+    figure.update_xaxes(title=None)
+    _plot(_figure_layout(figure))
+
+
+def _render_fulfilment_gate_trend(frame: pd.DataFrame, *, title: str) -> None:
+    required = {
+        "month",
+        "allocation_rate",
+        "post_allocation_fulfilment",
+        "fill_rate",
+    }
+    if frame.empty or not required.issubset(frame.columns):
+        render_empty_state(
+            "No fulfilment-gate trend",
+            "No eligible order cohort is available for allocation-to-delivery comparison.",
+        )
+        return
+    display = frame.copy()
+    labels = {
+        "allocation_rate": "Allocated / ordered",
+        "post_allocation_fulfilment": "Delivered / allocated",
+        "fill_rate": "Delivered / ordered",
+    }
+    for column in labels:
+        display[column] = pd.to_numeric(display[column], errors="coerce") * 100
+    long = display.melt(
+        id_vars=["month", "orders"],
+        value_vars=list(labels),
+        var_name="gate",
+        value_name="rate",
+    )
+    long["gate"] = long["gate"].map(labels)
+    figure = px.line(
+        long,
+        x="month",
+        y="rate",
+        color="gate",
+        markers=True,
+        hover_data={"orders": ":,", "gate": False},
+        color_discrete_sequence=[NAVY, TEAL, GOLD],
         title=title,
     )
     figure.update_yaxes(title="Percent", ticksuffix="%", rangemode="tozero")
@@ -297,7 +562,6 @@ def render_executive(
     definitions: Definitions,
     settings: Settings,
 ) -> None:
-    del settings
     page_header(
         "Executive Command Center",
         "One governed view of where customer service is being lost, where measured value "
@@ -305,9 +569,176 @@ def render_executive(
         period_label=context.period_label,
         chips=context.dimension_chips,
     )
-    summary = service.executive_summary(context.filters, context.basis)
-    previous = _previous_summary(service, context)
-    render_metric_cards(_rate_cards(summary, previous), columns=3)
+    eaches_summary = service.executive_summary(
+        context.filters, QuantityBasis.EACHES
+    )
+    cases_summary = service.executive_summary(
+        context.filters, QuantityBasis.CASE_EQUIVALENTS
+    )
+    summary = (
+        eaches_summary
+        if context.basis == QuantityBasis.EACHES
+        else cases_summary
+    )
+    previous_eaches = _previous_summary(service, context, QuantityBasis.EACHES)
+    previous_cases = _previous_summary(
+        service, context, QuantityBasis.CASE_EQUIVALENTS
+    )
+    delivery_summary = service.delivery_exception_summary(context.filters)
+    failure_pareto = service.failure_reason_pareto(context.filters, limit=5)
+    external_signals = _load_executive_external_signals(settings, context)
+    credit = eaches_summary.get("approved_credit_note_rate")
+    render_metric_cards(
+        [
+            MetricCard(
+                "Eaches fill rate",
+                format_metric_value(eaches_summary.get("fill_rate")),
+                _metric_detail(
+                    eaches_summary.get("fill_rate"), "ordered eaches delivered"
+                ),
+                comparison_delta(
+                    eaches_summary.get("fill_rate"),
+                    previous_eaches.get("fill_rate") if previous_eaches else None,
+                ),
+                "positive",
+            ),
+            MetricCard(
+                "Case-equivalent fill rate",
+                format_metric_value(cases_summary.get("fill_rate")),
+                _metric_detail(
+                    cases_summary.get("fill_rate"),
+                    "ordered case-equivalents delivered",
+                ),
+                comparison_delta(
+                    cases_summary.get("fill_rate"),
+                    previous_cases.get("fill_rate") if previous_cases else None,
+                ),
+                "positive",
+            ),
+            MetricCard(
+                "Allocation rate · eaches",
+                format_metric_value(eaches_summary.get("allocation_rate")),
+                _metric_detail(
+                    eaches_summary.get("allocation_rate"), "ordered eaches allocated"
+                ),
+                comparison_delta(
+                    eaches_summary.get("allocation_rate"),
+                    previous_eaches.get("allocation_rate")
+                    if previous_eaches
+                    else None,
+                ),
+                "info",
+            ),
+            MetricCard(
+                "Strict OTIF",
+                format_metric_value(eaches_summary.get("strict_otif")),
+                _metric_detail(eaches_summary.get("strict_otif"), "eligible orders"),
+                comparison_delta(
+                    eaches_summary.get("strict_otif"),
+                    previous_eaches.get("strict_otif") if previous_eaches else None,
+                ),
+                "danger",
+            ),
+            MetricCard(
+                "Timestamp-derived on time",
+                format_metric_value(eaches_summary.get("on_time_rate")),
+                _metric_detail(eaches_summary.get("on_time_rate"), "eligible orders"),
+                comparison_delta(
+                    eaches_summary.get("on_time_rate"),
+                    previous_eaches.get("on_time_rate") if previous_eaches else None,
+                ),
+                "info",
+            ),
+            MetricCard(
+                "Overdue open backlog",
+                format_metric_value(eaches_summary.get("overdue_backlog_orders")),
+                f"Current OPEN state through {context.filters.end_date:%d %b %Y}",
+                tone="warning",
+            ),
+            MetricCard(
+                "Excursions per 100 chilled",
+                format_metric_value(
+                    eaches_summary.get("temperature_excursions_per_100")
+                ),
+                _metric_detail(
+                    eaches_summary.get("temperature_excursions_per_100"),
+                    "chilled deliveries",
+                ),
+                tone="warning",
+            ),
+            MetricCard(
+                "Near-expiry available stock",
+                format_metric_value(eaches_summary.get("near_expiry_cases")),
+                "Latest weekly snapshot; 0–30 days remaining",
+                tone="warning",
+            ),
+            MetricCard(
+                "Post-allocation fulfilment",
+                format_metric_value(
+                    eaches_summary.get("post_allocation_fulfilment")
+                ),
+                _metric_detail(
+                    eaches_summary.get("post_allocation_fulfilment"),
+                    "allocated eaches delivered",
+                ),
+                tone="positive",
+            ),
+            MetricCard(
+                "Approved credit notes",
+                format_inr(credit.numerator if credit else None),
+                (
+                    f"{format_metric_value(credit)} of estimated dispatch value"
+                    if credit
+                    else "No governed credit-note denominator"
+                ),
+                tone="danger",
+            ),
+            MetricCard(
+                "Settled/paid freight / delivered case",
+                (
+                    f"₹{external_signals.paid_freight_per_case_inr:,.2f}"
+                    if external_signals.paid_freight_per_case_inr is not None
+                    else "Not available"
+                ),
+                f"PAID invoice amount ÷ delivered case-equivalents · period × "
+                f"{external_signals.freight_lens} lens · "
+                + external_signals.freight_detail,
+                tone="warning",
+            ),
+            MetricCard(
+                "Source-wide competitor match coverage",
+                _percent(external_signals.competitor_coverage),
+                (
+                    f"{external_signals.competitor_matched:,} of "
+                    f"{external_signals.competitor_listings:,} listings · "
+                    "all cities/retailers · "
+                    f"{external_signals.competitor_freshness}"
+                ),
+                tone=(
+                    "positive"
+                    if external_signals.competitor_coverage is not None
+                    else "warning"
+                ),
+            ),
+        ],
+        columns=4,
+    )
+    if external_signals.warnings:
+        render_callout(
+            "Optional external snapshot boundary",
+            "Core operational cards remain available. "
+            + " ".join(external_signals.warnings),
+            tone="warning",
+        )
+    if external_signals.freight_ignored_filters:
+        render_callout(
+            "Executive freight filter boundary",
+            "Freight invoices have no customer, outlet, channel, promotion, or order-source "
+            "keys. The settled freight card therefore cannot apply the active filter(s): "
+            + ", ".join(external_signals.freight_ignored_filters)
+            + ". Its period and available DC/route scope remain governed.",
+            tone="warning",
+        )
 
     ignored_inventory_filters = tuple(
         label
@@ -316,6 +747,8 @@ def render_executive(
             ("route", context.filters.route_codes),
             ("outlet", context.filters.outlet_codes),
             ("channel", context.filters.channels),
+            ("promotion", context.filters.promotion_codes),
+            ("order source", context.filters.order_sources),
         )
         if values
     )
@@ -326,57 +759,46 @@ def render_executive(
             "product keys but no historical customer/order key. These active filters therefore "
             "do not change that one card: "
             + ", ".join(ignored_inventory_filters)
-            + ". All other Executive service and leakage cards retain their documented filters.",
+            + ". Operational service and leakage cards retain their documented filters; "
+            "the external freight boundary is disclosed separately when applicable.",
             tone="warning",
         )
 
     strict_otif = summary.get("strict_otif")
     eligible_orders = strict_otif.denominator if strict_otif else None
-    render_callout(
-        "Strict OTIF is correctly reported as 0%",
-        "Every supplied order line is short-delivered, so no eligible order can be in full. "
-        f"The current scope contains {format_compact_number(eligible_orders)} eligible orders. "
-        "Fill rate and on-time performance remain informative; no tolerance has been invented.",
-        tone="danger",
-    )
+    if eligible_orders is not None and eligible_orders > 0:
+        render_callout(
+            "Strict OTIF is correctly reported as 0%",
+            "Every supplied order line is short-delivered, so no eligible order can be in full. "
+            f"The current scope contains {format_compact_number(eligible_orders)} eligible "
+            "orders. Fill rate and on-time performance remain informative; no tolerance has "
+            "been invented.",
+            tone="danger",
+        )
+    else:
+        render_callout(
+            "No eligible orders in this scope",
+            "Strict OTIF and other order-service ratios remain not available because the active "
+            "filters produce a zero denominator. Broaden the scope to restore evidence.",
+            tone="warning",
+        )
 
     section_header(
-        "Fulfilment gates and open backlog",
-        "Allocation and post-allocation ratios use the same eligible completed-order cohort. "
-        "Backlog is the current OPEN-order source state as of the selected period end.",
+        "Ranked exception and trust inbox",
+        "Rows are ordered by their descriptive exception/gap rate for triage. Rates are not "
+        "additive, causal, or a common financial severity score.",
     )
-    render_metric_cards(
-        [
-            MetricCard(
-                "Allocation rate",
-                format_metric_value(summary.get("allocation_rate")),
-                _metric_detail(summary.get("allocation_rate"), "ordered units allocated"),
-                comparison_delta(
-                    summary.get("allocation_rate"),
-                    previous.get("allocation_rate") if previous else None,
-                ),
-                "info",
-            ),
-            MetricCard(
-                "Post-allocation fulfilment",
-                format_metric_value(summary.get("post_allocation_fulfilment")),
-                _metric_detail(
-                    summary.get("post_allocation_fulfilment"), "allocated units delivered"
-                ),
-                comparison_delta(
-                    summary.get("post_allocation_fulfilment"),
-                    previous.get("post_allocation_fulfilment") if previous else None,
-                ),
-                "positive",
-            ),
-            MetricCard(
-                "Overdue open backlog",
-                format_metric_value(summary.get("overdue_backlog_orders")),
-                f"OPEN orders requested on or before {context.filters.end_date:%d %b %Y}",
-                tone="warning",
-            ),
-        ],
-        columns=3,
+    inbox = _build_executive_inbox(
+        eaches_summary, delivery_summary, external_signals, failure_pareto
+    )
+    dataframe_or_empty(
+        inbox,
+        empty_title="No ranked signals",
+        empty_body="No governed exception denominator is available for this scope.",
+        max_rows=8,
+        column_config={
+            "Review rate": st.column_config.NumberColumn(format="%.1f%%"),
+        },
     )
 
     section_header(
@@ -495,6 +917,9 @@ def render_executive(
             "temperature_excursions_per_100",
             "near_expiry_cases",
             "approved_credit_note_rate",
+            "short_delivery_value_exposure_inr",
+            "settled_freight_cost_per_case",
+            "competitor_match_coverage",
         ],
     )
     render_source_note(
@@ -541,11 +966,108 @@ def render_service(
         tone="warning",
     )
 
-    section_header("Performance over time")
-    _render_service_trend(
-        service.service_trend(context.filters, context.basis),
-        title=f"Monthly service · {context.quantity_label}",
+    section_header(
+        "Ordered → allocated → delivered → returned",
+        "The first three stages retain one requested-delivery line cohort. Returns are linked "
+        "physical-return signals observed through the selected end date.",
     )
+    flow = service.fulfilment_flow(context.filters, context.basis)
+    if flow.empty:
+        render_empty_state(
+            "No fulfilment flow",
+            "No eligible order lines match the active requested-delivery scope.",
+        )
+    else:
+        ordered = _sum_column(flow, "ordered_quantity")
+        allocated = _sum_column(flow, "allocated_quantity")
+        delivered = _sum_column(flow, "delivered_quantity")
+        returned = _sum_column(flow, "returned_quantity")
+        allocation_short = _sum_column(flow, "allocation_shortfall_quantity")
+        post_allocation_short = _sum_column(
+            flow, "post_allocation_shortfall_quantity"
+        )
+        eligible_lines = _sum_column(flow, "eligible_order_lines")
+        render_metric_cards(
+            [
+                MetricCard(
+                    "Ordered",
+                    format_compact_number(ordered),
+                    f"{format_compact_number(eligible_lines)} eligible order lines",
+                    tone="info",
+                ),
+                MetricCard(
+                    "Allocated",
+                    format_compact_number(allocated),
+                    "Same requested-delivery line cohort",
+                    tone="info",
+                ),
+                MetricCard(
+                    "Delivered",
+                    format_compact_number(delivered),
+                    "Same requested-delivery line cohort",
+                    tone="positive",
+                ),
+                MetricCard(
+                    "Linked returned",
+                    format_compact_number(returned),
+                    "All credit statuses observed through period end",
+                    tone="warning",
+                ),
+                MetricCard(
+                    "Allocation shortfall",
+                    format_compact_number(allocation_short),
+                    "Positive ordered less allocated quantity",
+                    tone="danger",
+                ),
+                MetricCard(
+                    "Post-allocation shortfall",
+                    format_compact_number(post_allocation_short),
+                    "Positive allocated less delivered quantity",
+                    tone="danger",
+                ),
+            ],
+            columns=3,
+        )
+        stages = pd.DataFrame(
+            {
+                "Stage": ["Ordered", "Allocated", "Delivered", "Linked returned"],
+                "Quantity": [ordered, allocated, delivered, returned],
+                "Signal": ["Fulfilment gate", "Fulfilment gate", "Fulfilment gate", "Return"],
+            }
+        ).dropna(subset=["Quantity"])
+        if not stages.empty:
+            figure = px.bar(
+                stages,
+                x="Stage",
+                y="Quantity",
+                color="Signal",
+                color_discrete_map={"Fulfilment gate": NAVY, "Return": GOLD},
+                title=f"Quantity gates · {context.quantity_label}",
+                text_auto=".3s",
+            )
+            figure.update_xaxes(title=None)
+            figure.update_yaxes(title=context.quantity_label)
+            _plot(_figure_layout(figure, height=330))
+        render_callout(
+            "Cohort and return boundary",
+            f"{flow.attrs.get('date_basis', 'Requested-delivery line cohort')}. "
+            f"{flow.attrs.get('warning', 'Returns are not a recovery or cash measure.')}",
+            tone="warning",
+        )
+
+    section_header("Performance over time")
+    trend = service.service_trend(context.filters, context.basis)
+    outcome_tab, gate_tab = st.tabs(["Customer outcome", "Fulfilment gates"])
+    with outcome_tab:
+        _render_service_trend(
+            trend,
+            title=f"Monthly service · {context.quantity_label}",
+        )
+    with gate_tab:
+        _render_fulfilment_gate_trend(
+            trend,
+            title=f"Monthly allocation and fulfilment gates · {context.quantity_label}",
+        )
 
     section_header(
         "Rank and diagnose",
@@ -558,6 +1080,9 @@ def render_service(
         "route": "Route",
         "outlet": "Outlet",
         "channel": "Channel",
+        "promotion": "Recorded promotion",
+        "promotion_mechanic": "Promotion mechanic",
+        "order_source": "Order source",
     }
     selected_dimension = st.selectbox(
         "Service dimension",
@@ -604,6 +1129,9 @@ def render_service(
         "warehouse": "Warehouse",
         "route": "Route",
         "sku": "SKU",
+        "promotion": "Recorded promotion",
+        "promotion_mechanic": "Promotion mechanic",
+        "order_source": "Order source",
     }
     selected_contributor = st.selectbox(
         "Shortage contributor",
@@ -633,30 +1161,148 @@ def render_service(
         _plot(_figure_layout(figure, height=390))
 
     section_header(
-        "Order evidence",
-        "Lowest-fill eligible orders supporting the view; limited to 200 rows for review.",
+        "Customer and logistics drill paths",
+        "Native order-line evidence retains order source, recorded promotion, product, quantity "
+        "gates, linked returns, and shortage value exposure; limited to 200 rows.",
     )
-    evidence = service.service_evidence(context.filters, limit=200).copy()
-    if not evidence.empty:
-        evidence["fill_rate_eaches"] *= 100
-        evidence["fill_rate_case_equivalents"] *= 100
+    line_evidence = service.service_line_evidence(context.filters, limit=200)
+    suffix = (
+        "eaches"
+        if context.basis == QuantityBasis.EACHES
+        else "case_equivalents"
+    )
+    quantity_columns = [
+        f"ordered_{suffix}",
+        f"allocated_{suffix}",
+        f"delivered_{suffix}",
+        f"returned_{suffix}",
+        f"short_{suffix}",
+    ]
+    customer_columns = [
+        "order_number",
+        "order_line_id",
+        "requested_delivery_date",
+        "customer_region_name",
+        "outlet_code",
+        "channel",
+        "source_system",
+        "promotion_code",
+        "promotion_mechanic",
+        "sku_code",
+        "product_name",
+        "category",
+        *quantity_columns,
+        "short_delivery_value_exposure_inr",
+    ]
+    logistics_columns = [
+        "order_number",
+        "order_line_id",
+        "requested_delivery_date",
+        "warehouse_code",
+        "route_code",
+        "source_system",
+        "promotion_code",
+        "sku_code",
+        *quantity_columns,
+        "short_reason_code",
+        "short_delivery_value_exposure_inr",
+    ]
+    customer_tab, logistics_tab, order_tab = st.tabs(
+        ["Customer path", "Logistics path", "Order outcome"]
+    )
+    evidence_config = {
+        "requested_delivery_date": st.column_config.DateColumn(
+            "Requested delivery", format="DD MMM YYYY"
+        ),
+        "short_delivery_value_exposure_inr": st.column_config.NumberColumn(
+            "Short-value exposure", format="₹%.2f"
+        ),
+    }
+    with customer_tab:
+        dataframe_or_empty(
+            line_evidence[
+                [column for column in customer_columns if column in line_evidence]
+            ],
+            empty_title="No customer-path lines",
+            empty_body="No eligible order lines match this requested-delivery scope.",
+            max_rows=200,
+            column_config=evidence_config,
+        )
+    with logistics_tab:
+        dataframe_or_empty(
+            line_evidence[
+                [column for column in logistics_columns if column in line_evidence]
+            ],
+            empty_title="No logistics-path lines",
+            empty_body="No eligible order lines match this requested-delivery scope.",
+            max_rows=200,
+            column_config=evidence_config,
+        )
+    with order_tab:
+        evidence = service.service_evidence(context.filters, limit=200).copy()
+        if not evidence.empty:
+            evidence["fill_rate_eaches"] *= 100
+            evidence["fill_rate_case_equivalents"] *= 100
+        dataframe_or_empty(
+            evidence,
+            empty_title="No order evidence",
+            empty_body="No eligible completed orders matched the active scope.",
+            max_rows=200,
+            column_config={
+                "fill_rate_eaches": st.column_config.NumberColumn(
+                    "Each fill rate", format="%.1f%%"
+                ),
+                "fill_rate_case_equivalents": st.column_config.NumberColumn(
+                    "Case-equivalent fill", format="%.1f%%"
+                ),
+                "derived_delay_minutes": st.column_config.NumberColumn(
+                    "Derived delay", format="%d min"
+                ),
+            },
+        )
+    render_source_note(
+        str(line_evidence.attrs.get("promotion_definition", "Promotions are descriptive."))
+        + " "
+        + str(line_evidence.attrs.get("return_date_basis", ""))
+    )
+
+    section_header(
+        "Orders recorded after product discontinuation",
+        "An audit exception at order-line grain; this is not proof that the product was "
+        "physically unavailable at the fulfilment location.",
+    )
+    discontinued = service.discontinued_order_evidence(context.filters, limit=100)
     dataframe_or_empty(
-        evidence,
-        empty_title="No order evidence",
-        empty_body="No eligible completed orders matched the active scope.",
+        discontinued,
+        empty_title="No discontinued-product order exceptions",
+        empty_body="No order lines recorded after their product discontinuation date match scope.",
+        max_rows=100,
         column_config={
-            "fill_rate_eaches": st.column_config.NumberColumn("Each fill rate", format="%.1f%%"),
-            "fill_rate_case_equivalents": st.column_config.NumberColumn(
-                "Case-equivalent fill", format="%.1f%%"
+            "order_date": st.column_config.DateColumn("Order date", format="DD MMM YYYY"),
+            "discontinued_date": st.column_config.DateColumn(
+                "Discontinued", format="DD MMM YYYY"
             ),
-            "derived_delay_minutes": st.column_config.NumberColumn(
-                "Derived delay", format="%d min"
+            "line_value_inr": st.column_config.NumberColumn(
+                "Booked line value", format="₹%.2f"
             ),
         },
     )
+    st.caption(
+        f"Showing {len(discontinued):,} most recent/high-value exception rows. This audit uses "
+        "order date, while headline service uses requested delivery date."
+    )
     render_definitions(
         definitions,
-        ["fill_rate", "strict_otif", "on_time_rate", "late_over_2h_rate"],
+        [
+            "fill_rate",
+            "allocation_rate",
+            "post_allocation_fulfilment",
+            "strict_otif",
+            "on_time_rate",
+            "late_over_2h_rate",
+            "short_delivery_value_exposure_inr",
+            "orders_after_discontinuation",
+        ],
     )
 
 
@@ -962,11 +1608,28 @@ def render_cold_chain(
     inventory = service.inventory_risk(context.filters, "warehouse")
     snapshot_date = inventory.attrs.get("snapshot_date")
     near_expiry_total = float(inventory["near_expiry_cases"].sum()) if not inventory.empty else None
+    expired_total = (
+        float(inventory["expired_available_cases"].sum())
+        if not inventory.empty
+        else None
+    )
     damaged_total = float(inventory["damaged_cases"].sum()) if not inventory.empty else None
     blocked_total = float(inventory["blocked_cases"].sum()) if not inventory.empty else None
     ignored_inventory_filters = tuple(inventory.attrs.get("ignored_filters", ()))
     render_metric_cards(
         [
+            MetricCard(
+                "Eligible chilled deliveries",
+                format_compact_number(excursion.denominator if excursion else None),
+                "Distinct eligible delivery records with chilled product",
+                tone="info",
+            ),
+            MetricCard(
+                "Source-flagged excursions",
+                format_compact_number(excursion.numerator if excursion else None),
+                "Distinct chilled deliveries carrying the source flag",
+                tone="danger",
+            ),
             MetricCard(
                 "Excursions per 100 chilled",
                 format_metric_value(excursion),
@@ -980,6 +1643,12 @@ def render_cold_chain(
                 if snapshot_date
                 else "No inventory snapshot in scope",
                 tone="warning",
+            ),
+            MetricCard(
+                "Expired available cases",
+                format_compact_number(expired_total),
+                "Positive available stock with negative snapshot-relative expiry days",
+                tone="danger",
             ),
             MetricCard(
                 "Damaged cases",
@@ -1012,12 +1681,75 @@ def render_cold_chain(
             tone="warning",
         )
 
+    section_header(
+        "Cold-chain trend and descriptive severity",
+        "Actual-delivery month; peak-temperature bands describe source-flagged records and "
+        "are not validated food-safety thresholds.",
+    )
+    cold_trend = service.cold_chain_trend(context.filters)
+    if cold_trend.empty:
+        render_empty_state(
+            "No cold-chain trend",
+            "No eligible chilled deliveries match this actual-delivery scope.",
+        )
+    else:
+        trend_columns = st.columns(2)
+        with trend_columns[0]:
+            figure = px.line(
+                cold_trend,
+                x="dimension_value",
+                y="excursions_per_100",
+                markers=True,
+                color_discrete_sequence=[RED],
+                title="Monthly excursions per 100 chilled deliveries",
+                hover_data={
+                    "chilled_deliveries": ":,",
+                    "excursions": ":,",
+                    "peak_excursion_max_temp_c": ":.1f",
+                },
+            )
+            figure.update_xaxes(title=None)
+            figure.update_yaxes(title="Excursions per 100", rangemode="tozero")
+            _plot(_figure_layout(figure, height=360))
+        with trend_columns[1]:
+            severity_labels = {
+                "flagged_peak_le_8c": "Flagged peak ≤8°C",
+                "flagged_peak_8_to_12c": "Flagged peak >8–12°C",
+                "flagged_peak_over_12c": "Flagged peak >12°C",
+                "flagged_peak_unavailable": "Flagged peak unavailable",
+            }
+            severity = cold_trend.melt(
+                id_vars=["dimension_value"],
+                value_vars=list(severity_labels),
+                var_name="band",
+                value_name="deliveries",
+            )
+            severity["band"] = severity["band"].map(severity_labels)
+            figure = px.bar(
+                severity,
+                x="dimension_value",
+                y="deliveries",
+                color="band",
+                barmode="stack",
+                color_discrete_sequence=[TEAL, GOLD, RED, NAVY],
+                title="Source-flagged deliveries by recorded peak band",
+            )
+            figure.update_xaxes(title=None)
+            figure.update_yaxes(title="Flagged deliveries")
+            _plot(_figure_layout(figure, height=360))
+        render_source_note(str(cold_trend.attrs.get("severity_definition", "")))
+
     section_header("Temperature-control hotspots")
     cold_dimensions = {
         "warehouse": "Warehouse",
         "route": "Route",
         "customer_region": "Customer region",
         "warehouse_region": "DC region",
+        "outlet": "Outlet",
+        "channel": "Channel",
+        "category": "Chilled category",
+        "promotion": "Recorded promotion",
+        "order_source": "Order source",
     }
     selected = st.selectbox(
         "Cold-chain dimension",
@@ -1040,12 +1772,21 @@ def render_cold_chain(
             color="excursions",
             color_continuous_scale=[GOLD, RED],
             title=f"Excursions per 100 by {cold_dimensions[selected].lower()}",
-            hover_data={"chilled_deliveries": ":,", "excursions": ":,"},
+            hover_data={
+                "chilled_deliveries": ":,",
+                "excursions": ":,",
+                "peak_excursion_max_temp_c": ":.1f",
+                "descriptive_peak_band": True,
+            },
         )
         figure.update_xaxes(title="Excursions per 100")
         figure.update_yaxes(title=None)
         figure.update_coloraxes(colorbar_title="Excursions")
         _plot(_figure_layout(figure, height=430))
+        warning = hotspots.attrs.get("warning")
+        if warning:
+            render_callout("Non-additive category boundary", str(warning), tone="warning")
+        render_source_note(str(hotspots.attrs.get("severity_definition", "")))
 
     section_header(
         "Inventory risk",
@@ -1083,6 +1824,73 @@ def render_cold_chain(
         )
         figure.update_yaxes(title=None)
         _plot(_figure_layout(figure, height=430))
+        inventory_columns = [
+            "dimension_value",
+            "available_cases",
+            "near_expiry_cases",
+            "expired_available_cases",
+            "damaged_cases",
+            "blocked_cases",
+        ]
+        dataframe_or_empty(
+            inventory_view[
+                [column for column in inventory_columns if column in inventory_view]
+            ],
+            empty_title="No inventory evidence",
+            empty_body="No inventory aggregates match this snapshot scope.",
+            max_rows=100,
+        )
+
+    section_header(
+        "Batch-level inventory evidence",
+        "Latest snapshot on or before period end; risk-only rows are ordered with expired and "
+        "near-expiry flags first.",
+    )
+    batch_evidence = service.inventory_batch_evidence(
+        context.filters, risk_only=True, limit=200
+    )
+    batch_columns = [
+        "snapshot_date",
+        "warehouse_region_name",
+        "warehouse_code",
+        "sku_code",
+        "product_name",
+        "category",
+        "is_chilled",
+        "storage_temp_band",
+        "batch_id",
+        "available_cases",
+        "expiry_date",
+        "expiry_days",
+        "damaged_cases",
+        "blocked_cases",
+        "storage_temp_celsius",
+        "near_expiry_flag",
+        "expired_stock_flag",
+        "damaged_stock_flag",
+        "blocked_stock_flag",
+    ]
+    dataframe_or_empty(
+        batch_evidence[
+            [column for column in batch_columns if column in batch_evidence]
+        ],
+        empty_title="No at-risk inventory batches",
+        empty_body=(
+            "No expired, near-expiry, damaged, or blocked batch rows match the latest scope."
+        ),
+        max_rows=200,
+        column_config={
+            "snapshot_date": st.column_config.DateColumn("Snapshot", format="DD MMM YYYY"),
+            "expiry_date": st.column_config.DateColumn("Expiry", format="DD MMM YYYY"),
+            "near_expiry_flag": st.column_config.CheckboxColumn("Near expiry"),
+            "expired_stock_flag": st.column_config.CheckboxColumn("Expired"),
+            "damaged_stock_flag": st.column_config.CheckboxColumn("Damaged"),
+            "blocked_stock_flag": st.column_config.CheckboxColumn("Blocked"),
+        },
+    )
+    render_source_note(
+        str(batch_evidence.attrs.get("grain", "Latest inventory batch snapshot evidence"))
+    )
 
     cold_returns = service.cold_chain_return_evidence(context.filters, limit=100)
     section_header(
@@ -1162,11 +1970,35 @@ def _sum_column(frame: pd.DataFrame, column: str) -> float | None:
     return float(values.sum()) if not values.empty else None
 
 
+def _sampled_route_ratios(
+    frame: pd.DataFrame, *, minimum_records: int = 25
+) -> pd.DataFrame:
+    required = {
+        "route_code",
+        "invoice_count",
+        "delivered_orders",
+        "freight_cost_per_delivered_case_inr",
+    }
+    if frame.empty or not required.issubset(frame.columns):
+        return pd.DataFrame(columns=list(required))
+    sampled = frame.dropna(subset=["freight_cost_per_delivered_case_inr"]).copy()
+    invoice_volume = pd.to_numeric(sampled["invoice_count"], errors="coerce").fillna(0)
+    delivery_volume = pd.to_numeric(
+        sampled["delivered_orders"], errors="coerce"
+    ).fillna(0)
+    return sampled.loc[
+        (invoice_volume >= minimum_records) & (delivery_volume >= minimum_records)
+    ]
+
+
 def _render_freight_frames(
     warehouse: pd.DataFrame,
     route: pd.DataFrame,
     carrier: pd.DataFrame,
     sync_status: pd.DataFrame | None = None,
+    previous_route: pd.DataFrame | None = None,
+    *,
+    primary_lens: str = "warehouse",
 ) -> None:
     if warehouse.empty and route.empty and carrier.empty:
         reason = (
@@ -1180,55 +2012,57 @@ def _render_freight_frames(
         )
         return
 
-    billed = _sum_column(warehouse, "freight_cost_inr")
-    detention = _sum_column(warehouse, "detention_cost_inr")
-    paid = _sum_column(warehouse, "paid_cost_inr")
-    pending = _sum_column(warehouse, "pending_cost_inr")
-    disputed = _sum_column(warehouse, "disputed_cost_inr")
-    invoice_count = _sum_column(warehouse, "invoice_count")
-    delivered_cases = _sum_column(warehouse, "delivered_case_equivalents")
+    if primary_lens not in {"warehouse", "route"}:
+        raise ValueError("primary_lens must be warehouse or route")
+    primary = route if primary_lens == "route" else warehouse
+    billed = _sum_column(primary, "freight_cost_inr")
+    detention = _sum_column(primary, "detention_cost_inr")
+    paid = _sum_column(primary, "paid_cost_inr")
+    pending = _sum_column(primary, "pending_cost_inr")
+    disputed = _sum_column(primary, "disputed_cost_inr")
+    invoice_count = _sum_column(primary, "invoice_count")
+    delivered_cases = _sum_column(primary, "delivered_case_equivalents")
     billed_per_case = (
         billed / delivered_cases
         if billed is not None and delivered_cases is not None and delivered_cases != 0.0
         else None
     )
+    paid_per_case = (
+        paid / delivered_cases
+        if paid is not None and delivered_cases is not None and delivered_cases != 0.0
+        else None
+    )
     render_metric_cards(
         [
             MetricCard(
+                "Settled/paid freight",
+                format_inr(paid),
+                f"Primary period × {primary_lens} settled-freight lens",
+                tone="positive",
+            ),
+            MetricCard(
+                "Settled/paid freight / delivered case",
+                f"₹{paid_per_case:,.2f}" if paid_per_case is not None else "Not available",
+                f"PAID invoices ÷ independently aggregated period × {primary_lens} cases",
+                tone="positive",
+            ),
+            MetricCard(
                 "Billed freight",
                 format_inr(billed),
-                f"{format_compact_number(invoice_count)} partner invoices",
+                f"{format_compact_number(invoice_count)} partner invoices · all statuses",
                 tone="info",
             ),
             MetricCard(
                 "Billed freight / delivered case",
                 f"₹{billed_per_case:,.2f}" if billed_per_case is not None else "Not available",
-                "Period × warehouse ratio of independently aggregated totals",
+                f"Period × {primary_lens} ratio of independently aggregated totals",
                 tone="warning",
-            ),
-            MetricCard(
-                "Detention charges",
-                format_inr(detention),
-                "Separately identified on partner invoices",
-                tone="danger",
-            ),
-            MetricCard(
-                "Delivered case-equivalents",
-                format_compact_number(delivered_cases),
-                "Operational denominator over the same period and warehouses",
-                tone="positive",
             ),
         ],
         columns=4,
     )
     render_metric_cards(
         [
-            MetricCard(
-                "Paid / settled freight",
-                format_inr(paid),
-                "Primary settled-freight status",
-                tone="positive",
-            ),
             MetricCard(
                 "Pending freight",
                 format_inr(pending),
@@ -1241,8 +2075,20 @@ def _render_freight_frames(
                 "Requires invoice-resolution review",
                 tone="danger",
             ),
+            MetricCard(
+                "Detention charges",
+                format_inr(detention),
+                "Separately identified on partner invoices",
+                tone="danger",
+            ),
+            MetricCard(
+                "Delivered case-equivalents",
+                format_compact_number(delivered_cases),
+                f"Operational denominator over the same period and {primary_lens}s",
+                tone="info",
+            ),
         ],
-        columns=3,
+        columns=4,
     )
 
     if sync_status is not None and not sync_status.empty and "source_name" in sync_status:
@@ -1288,11 +2134,14 @@ def _render_freight_frames(
             figure.update_yaxes(title=None)
             _plot(_figure_layout(figure, height=390))
     with chart_columns[1]:
-        valid_route = route.dropna(subset=["freight_cost_per_delivered_case_inr"]).copy()
+        minimum_route_records = 25
+        valid_route = _sampled_route_ratios(
+            route, minimum_records=minimum_route_records
+        )
         if valid_route.empty:
             render_empty_state(
-                "No route ratio",
-                "No route has both billed freight and delivered cases in this scope.",
+                "No sampled route ratio",
+                "No route has at least 25 invoices and 25 eligible delivered orders in scope.",
             )
         else:
             valid_route = valid_route.nlargest(
@@ -1307,12 +2156,118 @@ def _render_freight_frames(
                 y="label",
                 orientation="h",
                 color_discrete_sequence=[TEAL],
-                title="Top route freight per delivered case-equivalent",
-                hover_data={"freight_cost_inr": ":,.0f", "invoice_count": ":,.0f"},
+                title="Highest route freight ratios · minimum-volume sample",
+                hover_data={
+                    "freight_cost_inr": ":,.0f",
+                    "invoice_count": ":,.0f",
+                    "delivered_orders": ":,.0f",
+                    "delivered_case_equivalents": ":,.1f",
+                },
             )
             figure.update_xaxes(title="INR per case-equivalent", tickprefix="₹")
             figure.update_yaxes(title=None)
             _plot(_figure_layout(figure, height=460))
+            st.caption(
+                "Ranked only among routes with at least 25 partner invoices and 25 eligible "
+                "delivered orders; numerator and denominator remain independently aggregated."
+            )
+
+    sampled_current = _sampled_route_ratios(route)
+    section_header(
+        "Route cost rankings",
+        "Best means the lowest current billed ratio among minimum-volume routes. "
+        "Most improved compares the same ratio with the immediately preceding equal-length "
+        "period; lower is better.",
+    )
+    ranking_columns = st.columns(2)
+    with ranking_columns[0]:
+        st.markdown("**Best current route ratios**")
+        if sampled_current.empty:
+            render_empty_state(
+                "No qualified current routes",
+                "No route clears the 25-invoice and 25-delivery sample floor.",
+            )
+        else:
+            best = sampled_current.nsmallest(
+                5, "freight_cost_per_delivered_case_inr"
+            ).copy()
+            best["route"] = best["route_name"].fillna(best["route_code"])
+            dataframe_or_empty(
+                best[
+                    [
+                        "route",
+                        "freight_cost_per_delivered_case_inr",
+                        "invoice_count",
+                        "delivered_orders",
+                    ]
+                ],
+                empty_title="No best-route rows",
+                empty_body="No sampled route ratio is available.",
+                max_rows=5,
+                column_config={
+                    "freight_cost_per_delivered_case_inr": st.column_config.NumberColumn(
+                        "Billed freight / case", format="₹%.2f"
+                    )
+                },
+            )
+    with ranking_columns[1]:
+        st.markdown("**Most-improved route ratios**")
+        sampled_previous = _sampled_route_ratios(
+            previous_route if previous_route is not None else pd.DataFrame()
+        )
+        if sampled_current.empty or sampled_previous.empty:
+            render_empty_state(
+                "No comparable prior route sample",
+                "Both periods must clear the 25-invoice and 25-delivery floor per route.",
+            )
+        else:
+            prior = sampled_previous[
+                ["route_code", "freight_cost_per_delivered_case_inr"]
+            ].rename(
+                columns={
+                    "freight_cost_per_delivered_case_inr": "prior_freight_per_case_inr"
+                }
+            )
+            improved = sampled_current.merge(
+                prior,
+                on="route_code",
+                how="inner",
+                validate="one_to_one",
+            )
+            improved["change_inr_per_case"] = (
+                improved["freight_cost_per_delivered_case_inr"]
+                - improved["prior_freight_per_case_inr"]
+            )
+            improved["route"] = improved["route_name"].fillna(
+                improved["route_code"]
+            )
+            improved = improved.nsmallest(5, "change_inr_per_case")
+            dataframe_or_empty(
+                improved[
+                    [
+                        "route",
+                        "freight_cost_per_delivered_case_inr",
+                        "prior_freight_per_case_inr",
+                        "change_inr_per_case",
+                        "invoice_count",
+                        "delivered_orders",
+                    ]
+                ],
+                empty_title="No comparable route rows",
+                empty_body="No route appears in both qualified period samples.",
+                max_rows=5,
+                column_config={
+                    "freight_cost_per_delivered_case_inr": st.column_config.NumberColumn(
+                        "Current", format="₹%.2f"
+                    ),
+                    "prior_freight_per_case_inr": st.column_config.NumberColumn(
+                        "Prior", format="₹%.2f"
+                    ),
+                    "change_inr_per_case": st.column_config.NumberColumn(
+                        "Change", format="₹%+.2f"
+                    ),
+                },
+            )
 
     if carrier.empty:
         render_empty_state(
@@ -1333,15 +2288,22 @@ def _render_freight_frames(
         figure.update_yaxes(title=None)
         _plot(_figure_layout(figure, height=360))
 
-    attribution = warehouse.attrs.get("attribution") or carrier.attrs.get("attribution")
-    ignored = warehouse.attrs.get("ignored_filters") or carrier.attrs.get("ignored_filters")
+    attribution = primary.attrs.get("attribution") or carrier.attrs.get("attribution")
+    ignored = tuple(
+        dict.fromkeys(
+            value
+            for frame in (warehouse, route, carrier)
+            for value in frame.attrs.get("ignored_filters", ())
+        )
+    )
     if attribution:
         render_source_note(str(attribution))
     if ignored:
         render_callout(
             "Freight filter boundary",
-            "The invoice source has no customer/outlet/channel key, so these active filters "
-            "do not change either freight numerator or delivered-case denominator: "
+            "The invoice source lacks operational customer keys, and conflicting warehouse-route "
+            "pairs make DC and route separate lenses. These active filters are therefore "
+            "excluded from one or more displayed freight lenses: "
             + ", ".join(map(str, ignored))
             + ".",
             tone="warning",
@@ -1364,6 +2326,7 @@ def render_leakage(
     )
     summary = service.executive_summary(context.filters, context.basis)
     credit = summary.get("approved_credit_note_rate")
+    short_value = summary.get("short_delivery_value_exposure_inr")
     render_metric_cards(
         [
             MetricCard(
@@ -1384,8 +2347,18 @@ def render_leakage(
                 "Delivered proportion of booked net line value",
                 tone="info",
             ),
+            MetricCard(
+                "Short-delivery value exposure",
+                format_inr(short_value.value if short_value else None),
+                (
+                    f"{short_value.records:,} short-delivered order lines"
+                    if short_value
+                    else "No eligible short-delivered lines"
+                ),
+                tone="warning",
+            ),
         ],
-        columns=3,
+        columns=4,
     )
     render_callout(
         "Measured leakage, not profit",
@@ -1426,6 +2399,10 @@ def render_leakage(
         "route": "Route",
         "outlet": "Outlet",
         "sku": "SKU",
+        "disposition": "Disposition",
+        "promotion": "Recorded promotion",
+        "promotion_mechanic": "Promotion mechanic",
+        "order_source": "Order source",
     }
     selected = st.selectbox(
         "Approved leakage dimension",
@@ -1460,6 +2437,156 @@ def render_leakage(
         _plot(_figure_layout(figure, height=430))
 
     section_header(
+        "Physical disposition exposure",
+        "RESTOCK, SCRAP, and VENDOR_RECOVERY are recorded dispositions. Values below are "
+        "associated credit-note and physical-return exposure—not recovered cash.",
+    )
+    disposition = service.return_disposition_summary(context.filters)
+    if disposition.empty:
+        render_empty_state(
+            "No disposition evidence",
+            "No return-date credit-note lines match the active scope.",
+        )
+    else:
+        quantity_column = (
+            "return_eaches"
+            if context.basis == QuantityBasis.EACHES
+            else "return_case_equivalents"
+        )
+
+        def disposition_card(code: str, label: str, tone: Tone) -> MetricCard:
+            row = disposition.loc[
+                disposition["disposition"].astype(str).str.upper() == code
+            ]
+            if row.empty:
+                return MetricCard(
+                    label,
+                    "Not available",
+                    "No recorded disposition lines in scope",
+                    tone=tone,
+                )
+            values = row.iloc[0]
+            return MetricCard(
+                label,
+                format_inr(values.get("associated_credit_note_value_inr")),
+                (
+                    f"{format_compact_number(values.get(quantity_column))} "
+                    f"{context.quantity_label} · {int(values.get('credit_note_lines', 0)):,} lines"
+                ),
+                tone=tone,
+            )
+
+        render_metric_cards(
+            [
+                disposition_card("RESTOCK", "Recorded restock exposure", "info"),
+                disposition_card("SCRAP", "Recorded scrap exposure", "danger"),
+                disposition_card(
+                    "VENDOR_RECOVERY",
+                    "Recorded vendor-return exposure",
+                    "warning",
+                ),
+            ],
+            columns=3,
+        )
+        disposition_columns = [
+            "disposition",
+            "credit_note_lines",
+            "approved_lines",
+            "pending_lines",
+            "rejected_lines",
+            quantity_column,
+            "associated_credit_note_value_inr",
+            "approved_credit_note_value_inr",
+            "pending_credit_note_value_inr",
+            "rejected_credit_note_value_inr",
+        ]
+        dataframe_or_empty(
+            disposition[
+                [column for column in disposition_columns if column in disposition]
+            ],
+            empty_title="No disposition rows",
+            empty_body="No recorded disposition survived the active return-date scope.",
+            max_rows=20,
+            column_config={
+                "associated_credit_note_value_inr": st.column_config.NumberColumn(
+                    "Associated value", format="₹%.2f"
+                ),
+                "approved_credit_note_value_inr": st.column_config.NumberColumn(
+                    "Approved value", format="₹%.2f"
+                ),
+                "pending_credit_note_value_inr": st.column_config.NumberColumn(
+                    "Pending value", format="₹%.2f"
+                ),
+                "rejected_credit_note_value_inr": st.column_config.NumberColumn(
+                    "Rejected value", format="₹%.2f"
+                ),
+            },
+        )
+        render_callout(
+            "Disposition interpretation boundary",
+            str(disposition.attrs.get("warning", "Recorded disposition is not recovery.")),
+            tone="warning",
+        )
+
+    section_header(
+        "Short-delivery commercial exposure",
+        "Booked line value multiplied by the positive undelivered share. This prioritises "
+        "commercial exposure; it is not accounting loss, profit, cash, or causal attribution.",
+    )
+    exposure_dimensions = {
+        "category": "Category",
+        "warehouse": "Warehouse",
+        "route": "Route",
+        "customer_region": "Customer region",
+        "outlet": "Outlet",
+        "sku": "SKU",
+        "short_reason": "Recorded short reason",
+        "promotion": "Recorded promotion",
+        "order_source": "Order source",
+    }
+    exposure_dimension = st.selectbox(
+        "Short-delivery exposure dimension",
+        tuple(exposure_dimensions),
+        format_func=exposure_dimensions.get,
+        key="kp_short_value_dimension",
+    )
+    exposure = _safe_dimension(
+        service.short_delivery_exposure(
+            context.filters,
+            exposure_dimension,
+            context.basis,
+            limit=20,
+        )
+    )
+    if exposure.empty:
+        render_empty_state(
+            "No short-delivery exposure",
+            "No eligible short-delivered lines match this requested-delivery scope.",
+        )
+    else:
+        figure = px.bar(
+            exposure.head(15).sort_values("short_delivery_value_exposure_inr"),
+            x="short_delivery_value_exposure_inr",
+            y="dimension_value",
+            orientation="h",
+            color_discrete_sequence=[GOLD],
+            title=(
+                "Short-delivery value exposure by "
+                + exposure_dimensions[exposure_dimension].lower()
+            ),
+            hover_data={
+                "affected_orders": ":,",
+                "short_quantity": ":,.1f",
+                "allocation_short_value_exposure_inr": ":,.0f",
+                "post_allocation_short_value_exposure_inr": ":,.0f",
+            },
+        )
+        figure.update_xaxes(title="Exposure (INR)", tickprefix="₹")
+        figure.update_yaxes(title=None)
+        _plot(_figure_layout(figure, height=430))
+        render_source_note(str(exposure.attrs.get("value_definition", "")))
+
+    section_header(
         "Freight",
         "Only partner invoices qualify as freight cost; driver-entered fuel is never substituted.",
     )
@@ -1482,6 +2609,28 @@ def render_leakage(
             "freight_by_carrier",
             context.filters,
         )
+        active_period = Period(
+            context.filters.start_date,
+            context.filters.end_date,
+            context.period_label,
+        )
+        prior_period = previous_period(active_period)
+        previous_route = pd.DataFrame()
+        if prior_period.end >= context.data_min_date:
+            bounded_prior = Period(
+                max(prior_period.start, context.data_min_date),
+                prior_period.end,
+                prior_period.label,
+            )
+            previous_route_result = call_external(
+                external.payload,
+                "freight_by_route",
+                with_dates(context.filters, bounded_prior),
+            )
+            if previous_route_result.available and isinstance(
+                previous_route_result.payload, pd.DataFrame
+            ):
+                previous_route = previous_route_result.payload
         sync_result = call_external(external.payload, "sync_status")
         sync_frame = (
             sync_result.payload
@@ -1501,6 +2650,8 @@ def render_leakage(
                 route_result.payload,
                 carrier_result.payload,
                 sync_frame,
+                previous_route,
+                primary_lens=("route" if context.filters.route_codes else "warehouse"),
             )
         else:
             messages = [
@@ -1516,20 +2667,53 @@ def render_leakage(
         "Freight attribution boundary",
         "The API has no order or delivery ID. Freight-per-case must aggregate numerator and "
         "denominator independently by period plus warehouse, or period plus route. Carrier-level "
-        "delivered cases and invoice-to-delivery lineage are not claimed.",
+        "delivered cases and invoice-to-delivery lineage are not claimed. In the supplied full "
+        "history, 36,370 of 41,500 invoice warehouse-route pairs conflict with the route master; "
+        "DC and route lenses therefore remain independent and are never combined into a "
+        "composite attribution.",
         tone="warning",
     )
     render_definitions(
         definitions,
-        ["approved_credit_note_rate", "freight_cost_per_case"],
+        [
+            "approved_credit_note_rate",
+            "approved_credit_note_value_inr",
+            "short_delivery_value_exposure_inr",
+            "settled_freight_cost_per_case",
+            "freight_cost_per_case",
+        ],
     )
 
 
-def _render_competitor_governance(external_service: Any, city: str) -> None:
+def _render_competitor_governance(
+    external_service: Any,
+    city: str,
+    *,
+    retailer: str | None = None,
+    category: str | None = None,
+    matched_listings: pd.DataFrame | None = None,
+    source_coverage: pd.DataFrame | None = None,
+) -> None:
     section_header(
-        "Match review and append-only history",
+        "Listing coverage, match review, and source history",
         "Unresolved listings stay outside headline price metrics. Reviewed YAML decisions carry "
-        "reviewer, date, note, source, and algorithm provenance.",
+        "reviewer, date, note, source, and algorithm provenance; source-dated prices remain "
+        "evidence rather than a historical KPI headline.",
+    )
+    coverage = source_coverage if source_coverage is not None else pd.DataFrame()
+    dataframe_or_empty(
+        coverage,
+        empty_title="No source-dated price coverage",
+        empty_body="No allowed detail-page history matches this city and retailer scope.",
+        max_rows=50,
+        column_config={
+            "coverage_start": st.column_config.DateColumn(
+                "Coverage start", format="DD MMM YYYY"
+            ),
+            "coverage_end": st.column_config.DateColumn(
+                "Coverage end", format="DD MMM YYYY"
+            ),
+        },
     )
     queue_result = call_external(
         external_service,
@@ -1537,18 +2721,27 @@ def _render_competitor_governance(external_service: Any, city: str) -> None:
         city=city,
         limit=100,
     )
-    if not queue_result.available or not isinstance(queue_result.payload, pd.DataFrame):
+    if queue_result.available and isinstance(queue_result.payload, pd.DataFrame):
+        queue = queue_result.payload
+    else:
+        queue = pd.DataFrame()
         render_empty_state("Review queue unavailable", queue_result.message)
-        return
-    queue = queue_result.payload
     governance = queue.attrs.get("governance")
     if governance:
         render_callout("Governed exclusion boundary", str(governance), tone="warning")
+    if retailer and "retailer" in queue:
+        queue = queue.loc[queue["retailer"].astype(str) == retailer].copy()
+    if category and "observed_category" in queue:
+        queue = queue.loc[queue["observed_category"].astype(str) == category].copy()
     queue_columns = [
         "listing_id",
         "city",
         "retailer",
         "raw_title",
+        "observed_brand",
+        "observed_category",
+        "observed_pack_value",
+        "observed_pack_uom",
         "current_price_inr",
         "last_seen",
         "match_status",
@@ -1575,56 +2768,243 @@ def _render_competitor_governance(external_service: Any, city: str) -> None:
             ),
         },
     )
-    if queue.empty or "listing_id" not in queue:
-        return
-    listing_ids = list(dict.fromkeys(queue["listing_id"].dropna().astype(str)))
-    if not listing_ids:
-        return
-    selected_listing = st.selectbox(
-        "Listing observation history",
-        listing_ids,
-        key="kp_market_history_listing",
-        help="Inspect append-only observation and match-decision provenance for one listing.",
+
+    catalog_parts: list[pd.DataFrame] = []
+    matched_catalog_result = call_external(
+        external_service,
+        "competitor_matched_listing_catalog",
+        city=city,
+        retailer=retailer,
+        category=category,
+        limit=1_000,
     )
-    history_result = call_external(
+    if matched_catalog_result.available and isinstance(
+        matched_catalog_result.payload, pd.DataFrame
+    ):
+        governed_catalog = matched_catalog_result.payload
+        if not governed_catalog.empty:
+            catalog_parts.append(governed_catalog.copy())
+    elif matched_listings is not None and not matched_listings.empty:
+        uses_current_listing_schema = "listing_id" in matched_listings
+        matched_columns = (
+            ["listing_id", "retailer", "raw_title", "sku_code"]
+            if uses_current_listing_schema
+            else [
+                "competitor_listing_id",
+                "competitor_retailer",
+                "competitor_raw_title",
+                "sku_code",
+            ]
+        )
+        matched_catalog = matched_listings[
+            [column for column in matched_columns if column in matched_listings]
+        ].copy()
+        matched_catalog = matched_catalog.rename(
+            columns={
+                "competitor_listing_id": "listing_id",
+                "competitor_retailer": "retailer",
+                "competitor_raw_title": "raw_title",
+            }
+        )
+        matched_catalog["match_status"] = "matched"
+        catalog_parts.append(matched_catalog)
+    if not queue.empty and "listing_id" in queue:
+        unresolved_columns = [
+            "listing_id",
+            "retailer",
+            "raw_title",
+            "suggested_sku_code",
+            "match_status",
+        ]
+        unresolved_catalog = queue[
+            [column for column in unresolved_columns if column in queue]
+        ].copy()
+        unresolved_catalog = unresolved_catalog.rename(
+            columns={"suggested_sku_code": "sku_code"}
+        )
+        catalog_parts.append(unresolved_catalog)
+    if not catalog_parts:
+        render_empty_state(
+            "No listing available for history",
+            "Neither a retained matched listing nor an unresolved review listing is in scope.",
+        )
+        return
+    listing_catalog = pd.concat(catalog_parts, ignore_index=True, sort=False)
+    listing_catalog = listing_catalog.dropna(subset=["listing_id"]).copy()
+    listing_catalog["listing_id"] = listing_catalog["listing_id"].astype(str)
+    listing_catalog = listing_catalog.drop_duplicates("listing_id", keep="first")
+    if listing_catalog.empty:
+        render_empty_state(
+            "No listing available for history",
+            "The current evidence rows contain no listing identifier.",
+        )
+        return
+    listing_labels: dict[str, str] = {}
+    for _, row in listing_catalog.iterrows():
+        listing_id = str(row["listing_id"])
+        status = str(row.get("match_status") or "unknown")
+        listing_retailer = str(row.get("retailer") or "Unknown retailer")
+        title = str(row.get("raw_title") or "Untitled listing")
+        listing_labels[listing_id] = (
+            f"{status} · {listing_retailer} · {listing_id} · {title[:70]}"
+        )
+    listing_ids = list(listing_labels)
+    selected_listing = st.selectbox(
+        "Matched or unresolved listing history",
+        listing_ids,
+        format_func=listing_labels.get,
+        key="kp_market_history_listing",
+        help=(
+            "Inspect source-published dated prices and the separate collection/match audit "
+            "trail for one retained matched or unresolved listing."
+        ),
+    )
+    source_history_result = call_external(
+        external_service,
+        "competitor_source_price_history",
+        listing_id=selected_listing,
+        limit=1_000,
+    )
+    audit_history_result = call_external(
         external_service,
         "competitor_observation_history",
         selected_listing,
         limit=100,
     )
-    if not history_result.available or not isinstance(history_result.payload, pd.DataFrame):
-        render_empty_state("Observation history unavailable", history_result.message)
-        return
-    history = history_result.payload
-    history_columns = [
-        "collected_at_utc",
-        "current_price_inr",
-        "is_available",
-        "last_seen",
-        "match_status",
-        "sku_code",
-        "match_provenance",
-        "algorithm_status",
-        "decision_source",
-        "reviewer",
-        "reviewed_on",
-        "review_note",
-        "sync_id",
-        "observation_id",
-    ]
-    dataframe_or_empty(
-        history[[column for column in history_columns if column in history]],
-        empty_title="No observation history",
-        empty_body="No append-only observations were found for the selected listing.",
-        max_rows=100,
-        column_config={
-            "current_price_inr": st.column_config.NumberColumn(
-                "Observed price", format="₹%.2f"
-            ),
-            "last_seen": st.column_config.DateColumn("Last seen", format="DD MMM YYYY"),
-            "reviewed_on": st.column_config.DateColumn("Reviewed", format="DD MMM YYYY"),
-        },
+    source_tab, audit_tab = st.tabs(
+        ["Source-dated price evidence", "Collection and match audit"]
     )
+    with source_tab:
+        if source_history_result.available and isinstance(
+            source_history_result.payload, pd.DataFrame
+        ):
+            source_history = source_history_result.payload
+            source_columns = [
+                "observed_on",
+                "retailer",
+                "raw_title",
+                "observed_price_inr",
+                "observed_pack_value",
+                "observed_pack_uom",
+                "sku_code",
+                "product_name",
+                "kestrel_pack_value",
+                "kestrel_pack_uom",
+                "pack_comparable",
+                "unit_price_basis",
+                "observed_unit_price_inr",
+                "historical_kestrel_mrp_inr",
+                "historical_kestrel_mrp_unit_inr",
+                "historical_unit_price_gap_inr",
+                "historical_mrp_premium_pct",
+                "mrp_history_available",
+                "mrp_effective_from",
+                "mrp_effective_to",
+                "match_status",
+                "match_confidence",
+                "match_provenance",
+                "decision_source",
+                "reviewer",
+                "reviewed_on",
+                "source_path",
+            ]
+            dataframe_or_empty(
+                source_history[
+                    [column for column in source_columns if column in source_history]
+                ],
+                empty_title="No source-dated price rows",
+                empty_body=(
+                    "The listing is selectable from current match evidence but has no parsed "
+                    "source-published price history."
+                ),
+                max_rows=1_000,
+                column_config={
+                    "observed_on": st.column_config.DateColumn(
+                        "Observed on", format="DD MMM YYYY"
+                    ),
+                    "observed_price_inr": st.column_config.NumberColumn(
+                        "Observed pack price", format="₹%.2f"
+                    ),
+                    "observed_unit_price_inr": st.column_config.NumberColumn(
+                        "Observed unit price", format="₹%.2f"
+                    ),
+                    "historical_kestrel_mrp_inr": st.column_config.NumberColumn(
+                        "Effective Kestrel MRP", format="₹%.2f"
+                    ),
+                    "historical_kestrel_mrp_unit_inr": st.column_config.NumberColumn(
+                        "Effective MRP / unit", format="₹%.2f"
+                    ),
+                    "historical_unit_price_gap_inr": st.column_config.NumberColumn(
+                        "Historical unit gap", format="₹%.2f"
+                    ),
+                    "historical_mrp_premium_pct": st.column_config.NumberColumn(
+                        "Historical premium", format="%.1f%%"
+                    ),
+                    "pack_comparable": st.column_config.CheckboxColumn(
+                        "Comparable pack"
+                    ),
+                    "mrp_history_available": st.column_config.CheckboxColumn(
+                        "Effective MRP found"
+                    ),
+                },
+            )
+            render_callout(
+                "Historical evidence—not a KPI headline",
+                f"{source_history.attrs.get('history_grain', '')} "
+                f"{source_history.attrs.get('mrp_methodology', '')} "
+                f"{source_history.attrs.get('pack_methodology', '')}",
+                tone="warning",
+            )
+        else:
+            render_empty_state(
+                "Source-dated price history unavailable",
+                source_history_result.message,
+            )
+    with audit_tab:
+        if audit_history_result.available and isinstance(
+            audit_history_result.payload, pd.DataFrame
+        ):
+            audit_history = audit_history_result.payload
+            audit_columns = [
+                "collected_at_utc",
+                "current_price_inr",
+                "is_available",
+                "last_seen",
+                "match_status",
+                "sku_code",
+                "match_provenance",
+                "algorithm_status",
+                "decision_source",
+                "reviewer",
+                "reviewed_on",
+                "review_note",
+                "sync_id",
+                "observation_id",
+            ]
+            dataframe_or_empty(
+                audit_history[
+                    [column for column in audit_columns if column in audit_history]
+                ],
+                empty_title="No collection audit history",
+                empty_body="No append-only scrape audit rows exist for this listing.",
+                max_rows=100,
+                column_config={
+                    "current_price_inr": st.column_config.NumberColumn(
+                        "Observed price", format="₹%.2f"
+                    ),
+                    "last_seen": st.column_config.DateColumn(
+                        "Last seen", format="DD MMM YYYY"
+                    ),
+                    "reviewed_on": st.column_config.DateColumn(
+                        "Reviewed", format="DD MMM YYYY"
+                    ),
+                },
+            )
+        else:
+            render_empty_state(
+                "Collection audit history unavailable",
+                audit_history_result.message,
+            )
 
 
 def _render_context_result(title: str, result: ContextAssociationResult) -> None:
@@ -1716,7 +3096,6 @@ def render_market(
     definitions: Definitions,
     settings: Settings,
 ) -> None:
-    del service
     page_header(
         "Market & External Context",
         "Compare current Kestrel MRP with the lowest latest-observed competitor shelf price. "
@@ -1739,6 +3118,12 @@ def render_market(
         if quality_result.available and isinstance(quality_result.payload, pd.DataFrame)
         else pd.DataFrame()
     )
+    sync_result = call_external(external.payload, "sync_status")
+    sync_status = (
+        sync_result.payload
+        if sync_result.available and isinstance(sync_result.payload, pd.DataFrame)
+        else pd.DataFrame()
+    )
     city_options = (
         sorted(quality["city"].dropna().astype(str).unique()) if "city" in quality else []
     )
@@ -1747,23 +3132,84 @@ def render_market(
     elif "Mumbai" in city_options:
         city_options = ["Mumbai", *(item for item in city_options if item != "Mumbai")]
     city = st.selectbox("Market city", city_options, key="kp_market_city")
+    source_coverage_result = call_external(
+        external.payload,
+        "competitor_source_price_coverage",
+        city=city,
+    )
+    source_coverage = (
+        source_coverage_result.payload
+        if source_coverage_result.available
+        and isinstance(source_coverage_result.payload, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    retailer_options = (
+        sorted(source_coverage["retailer"].dropna().astype(str).unique())
+        if "retailer" in source_coverage
+        else []
+    )
+    selected_retailer = st.selectbox(
+        "Retailer",
+        ["All retailers", *retailer_options],
+        key="kp_market_retailer",
+        help=(
+            "Retailers come from parsed source-dated detail-page coverage for the selected city."
+        ),
+    )
+    retailer = None if selected_retailer == "All retailers" else selected_retailer
+    market_scope = f"{city} · {retailer or 'all retailers'}"
+    scoped_source_coverage = source_coverage
+    if retailer and "retailer" in scoped_source_coverage:
+        scoped_source_coverage = scoped_source_coverage.loc[
+            scoped_source_coverage["retailer"].astype(str) == retailer
+        ].copy()
 
     initial_result = call_external(
         external.payload,
         "competitor_price_gap",
         context.filters,
         city=city,
+        retailer=retailer,
         top_n=100,
     )
     if not initial_result.available or not isinstance(initial_result.payload, pd.DataFrame):
         render_empty_state("Competitor metrics unavailable", initial_result.message)
-        _render_competitor_governance(external.payload, city)
+        _render_competitor_governance(
+            external.payload,
+            city,
+            retailer=retailer,
+            source_coverage=scoped_source_coverage,
+        )
         _render_external_context(settings, context)
         render_definitions(definitions, ["competitor_price_gap"])
         return
     initial = initial_result.payload
-    categories = (
-        sorted(initial["category"].dropna().astype(str).unique()) if "category" in initial else []
+    all_matches_result = call_external(
+        external.payload,
+        "competitor_current_comparable_matches",
+        city=city,
+        retailer=retailer,
+        limit=1000,
+    )
+    all_matches = (
+        all_matches_result.payload
+        if all_matches_result.available
+        and isinstance(all_matches_result.payload, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    categories = sorted(
+        {
+            *(
+                initial["category"].dropna().astype(str).tolist()
+                if "category" in initial
+                else []
+            ),
+            *(
+                all_matches["category"].dropna().astype(str).tolist()
+                if "category" in all_matches
+                else []
+            ),
+        }
     )
     selected_category = st.selectbox(
         "Category",
@@ -1772,6 +3218,7 @@ def render_market(
     )
     if selected_category == "All categories":
         frame = initial
+        scoped_all_matches = all_matches
     else:
         category_result = call_external(
             external.payload,
@@ -1779,25 +3226,62 @@ def render_market(
             context.filters,
             city=city,
             category=selected_category,
+            retailer=retailer,
             top_n=100,
         )
         if not category_result.available or not isinstance(category_result.payload, pd.DataFrame):
             render_empty_state("Category price gap unavailable", category_result.message)
-            _render_competitor_governance(external.payload, city)
+            _render_competitor_governance(
+                external.payload,
+                city,
+                retailer=retailer,
+                category=selected_category,
+                source_coverage=scoped_source_coverage,
+            )
             _render_external_context(settings, context)
             return
         frame = category_result.payload
+        scoped_matches_result = call_external(
+            external.payload,
+            "competitor_current_comparable_matches",
+            city=city,
+            retailer=retailer,
+            category=selected_category,
+            limit=1000,
+        )
+        scoped_all_matches = (
+            scoped_matches_result.payload
+            if scoped_matches_result.available
+            and isinstance(scoped_matches_result.payload, pd.DataFrame)
+            else pd.DataFrame()
+        )
 
-    if frame.empty:
+    if frame.empty and scoped_all_matches.empty:
         reason = frame.attrs.get("unavailable_reason")
         render_empty_state(
             "No price-position rows",
             str(reason or "No eligible high-value Kestrel SKUs match the active scope and market."),
         )
-        _render_competitor_governance(external.payload, city)
+        _render_competitor_governance(
+            external.payload,
+            city,
+            retailer=retailer,
+            category=(
+                None if selected_category == "All categories" else selected_category
+            ),
+            source_coverage=scoped_source_coverage,
+        )
         _render_external_context(settings, context)
         render_definitions(definitions, ["competitor_price_gap"])
         return
+    if frame.empty:
+        render_callout(
+            "No operational top-SKU cohort",
+            "The active order filters contain no eligible dispatch-ranked SKU rows. Current "
+            "qualifying source listings remain available below because they use the selected "
+            "market city, retailer, and category rather than order dimensions.",
+            tone="warning",
+        )
 
     matched = frame.dropna(subset=["lowest_competitor_price_inr"]).copy()
     observation_dates = (
@@ -1812,6 +3296,33 @@ def render_market(
         else None
     )
     coverage_rate = len(matched) / len(frame) if len(frame) else None
+    city_quality = (
+        quality.loc[quality["city"].astype(str) == city].copy()
+        if "city" in quality
+        else pd.DataFrame()
+    )
+    city_listings = (
+        int(pd.to_numeric(city_quality["listings"], errors="coerce").fillna(0).sum())
+        if "listings" in city_quality
+        else 0
+    )
+    city_matched = 0
+    if {"match_status", "listings"}.issubset(city_quality.columns):
+        city_matched = int(
+            pd.to_numeric(
+                city_quality.loc[
+                    city_quality["match_status"].astype(str).str.casefold()
+                    == "matched",
+                    "listings",
+                ],
+                errors="coerce",
+            )
+            .fillna(0)
+            .sum()
+        )
+    city_match_coverage = city_matched / city_listings if city_listings else None
+    unmatched = frame.loc[frame["lowest_competitor_price_inr"].isna()]
+    unmatched_dispatch_value = _sum_column(unmatched, "dispatch_value_inr")
     render_metric_cards(
         [
             MetricCard(
@@ -1827,6 +3338,18 @@ def render_market(
                 tone="positive",
             ),
             MetricCard(
+                f"{city} listing match coverage",
+                _percent(city_match_coverage),
+                f"{city_matched:,} of {city_listings:,} current city-wide listings",
+                tone="positive" if city_match_coverage is not None else "warning",
+            ),
+            MetricCard(
+                "Unmatched top-SKU value",
+                format_inr(unmatched_dispatch_value),
+                f"{len(unmatched):,} of {len(frame):,} reviewed SKUs lack a qualifying price",
+                tone="warning",
+            ),
+            MetricCard(
                 "Average MRP premium",
                 f"{average_premium:+.1f}%" if average_premium is not None else "Not available",
                 "Versus the lowest qualifying observed shelf price",
@@ -1835,11 +3358,12 @@ def render_market(
             MetricCard(
                 "Latest observation",
                 latest_seen.strftime("%d %b %Y") if pd.notna(latest_seen) else "Unknown",
-                f"BazaarPulse · {city} · not a live price",
+                f"BazaarPulse · {market_scope} · "
+                f"{_source_sync_detail(sync_status, 'bazaarpulse')}",
                 tone="warning",
             ),
         ],
-        columns=4,
+        columns=3,
     )
     methodology = frame.attrs.get("methodology")
     render_callout(
@@ -1876,10 +3400,19 @@ def render_market(
                 "MRP above observed": RED,
                 "MRP below observed": TEAL,
             },
-            title=f"Current Kestrel MRP premium vs observed shelf price · {city}",
+            title=f"Current comparable-pack MRP premium · {market_scope}",
             hover_data={
                 "kestrel_mrp_inr": ":.2f",
                 "lowest_competitor_price_inr": ":.2f",
+                "competitor_retailer": True,
+                "competitor_listing_id": True,
+                "observed_pack_value": ":.2f",
+                "observed_pack_uom": True,
+                "kestrel_pack_value": ":.2f",
+                "kestrel_pack_uom": True,
+                "unit_price_basis": True,
+                "lowest_competitor_unit_price_inr": ":.2f",
+                "kestrel_mrp_unit_inr": ":.2f",
                 "matched_listings": ":,.0f",
             },
         )
@@ -1888,8 +3421,111 @@ def render_market(
         _plot(_figure_layout(figure, height=max(400, min(720, len(chart) * 30))))
 
     section_header(
-        "SKU evidence",
-        "Unmatched top SKUs remain explicit; a missing competitor price is not treated as zero.",
+        "Service-price attention signals",
+        "Period-specific line fill and short-delivery value exposure are paired by SKU with the "
+        "latest source-dated price evidence. This is descriptive triage, not causation or margin.",
+    )
+    attention_result = call_external(
+        external.payload,
+        "competitor_service_price_attention",
+        context.filters,
+        city=city,
+        retailer=retailer,
+        category=(
+            None if selected_category == "All categories" else selected_category
+        ),
+        top_n=100,
+    )
+    if not attention_result.available or not isinstance(
+        attention_result.payload, pd.DataFrame
+    ):
+        render_empty_state(
+            "Service-price attention unavailable",
+            attention_result.message,
+        )
+    else:
+        service_price = attention_result.payload
+        attention_columns = [
+            "sku_code",
+            "product_name",
+            "category",
+            "eligible_orders",
+            "line_fill_rate_pct",
+            "short_delivery_value_exposure_inr",
+            "short_case_equivalents",
+            "estimated_dispatch_value_inr",
+            "listing_id",
+            "retailer",
+            "observed_on",
+            "observed_price_inr",
+            "observed_pack_value",
+            "observed_pack_uom",
+            "kestrel_pack_value",
+            "kestrel_pack_uom",
+            "pack_comparable",
+            "unit_price_basis",
+            "observed_unit_price_inr",
+            "historical_kestrel_mrp_unit_inr",
+            "historical_unit_price_gap_inr",
+            "historical_mrp_premium_pct",
+            "price_evidence_status",
+        ]
+        dataframe_or_empty(
+            service_price[
+                [column for column in attention_columns if column in service_price]
+            ],
+            empty_title="No service-price attention rows",
+            empty_body="No eligible service SKU matches this market evidence scope.",
+            max_rows=100,
+            column_config={
+                "line_fill_rate_pct": st.column_config.NumberColumn(
+                    "Line fill rate", format="%.1f%%"
+                ),
+                "observed_on": st.column_config.DateColumn(
+                    "Observed on", format="DD MMM YYYY"
+                ),
+                "observed_price_inr": st.column_config.NumberColumn(
+                    "Observed pack price", format="₹%.2f"
+                ),
+                "estimated_dispatch_value_inr": st.column_config.NumberColumn(
+                    "Estimated dispatch value", format="₹%.0f"
+                ),
+                "short_delivery_value_exposure_inr": st.column_config.NumberColumn(
+                    "Short-value exposure", format="₹%.0f"
+                ),
+                "pack_comparable": st.column_config.CheckboxColumn(
+                    "Comparable pack"
+                ),
+                "observed_unit_price_inr": st.column_config.NumberColumn(
+                    "Observed unit price", format="₹%.2f"
+                ),
+                "historical_kestrel_mrp_unit_inr": st.column_config.NumberColumn(
+                    "Effective MRP / unit", format="₹%.2f"
+                ),
+                "historical_unit_price_gap_inr": st.column_config.NumberColumn(
+                    "Effective unit gap", format="₹%.2f"
+                ),
+                "historical_mrp_premium_pct": st.column_config.NumberColumn(
+                    "Effective premium", format="%.1f%%"
+                ),
+            },
+        )
+        render_callout(
+            "Attention flag—not an explanation",
+            str(
+                service_price.attrs.get(
+                    "methodology",
+                    "Service and price evidence are independently selected by SKU; this is "
+                    "not evidence that price caused fill loss.",
+                )
+            ),
+            tone="warning",
+        )
+
+    section_header(
+        "Current comparable-pack SKU evidence",
+        "The retained lowest listing and retailer are explicit. Only exact normalized-quantity "
+        "matches contribute; missing or non-comparable candidates remain null, never zero.",
     )
     columns = [
         "sku_code",
@@ -1903,6 +3539,18 @@ def render_market(
         "matched_listings",
         "retailers",
         "latest_observation_date",
+        "competitor_listing_id",
+        "competitor_retailer",
+        "competitor_raw_title",
+        "observed_pack_value",
+        "observed_pack_uom",
+        "kestrel_pack_value",
+        "kestrel_pack_uom",
+        "pack_comparable",
+        "unit_price_basis",
+        "lowest_competitor_unit_price_inr",
+        "kestrel_mrp_unit_inr",
+        "unit_price_gap_inr",
     ]
     dataframe_or_empty(
         frame[[column for column in columns if column in frame]],
@@ -1922,31 +3570,155 @@ def render_market(
             "latest_observation_date": st.column_config.DateColumn(
                 "Latest observed", format="DD MMM YYYY"
             ),
+            "pack_comparable": st.column_config.CheckboxColumn(
+                "Exact normalized pack"
+            ),
+            "lowest_competitor_unit_price_inr": st.column_config.NumberColumn(
+                "Observed unit price", format="₹%.2f"
+            ),
+            "kestrel_mrp_unit_inr": st.column_config.NumberColumn(
+                "Kestrel MRP / unit", format="₹%.2f"
+            ),
+            "unit_price_gap_inr": st.column_config.NumberColumn(
+                "Unit-price gap", format="₹%.2f"
+            ),
         },
     )
 
-    section_header("Match-quality coverage")
+    section_header(
+        "All current qualifying listing matches",
+        "Complete selected-city listing evidence, independent of the top-SKU dispatch ranking. "
+        "Every available governed match with an exact normalized pack is retained.",
+    )
+    all_match_columns = [
+        "listing_id",
+        "retailer",
+        "raw_title",
+        "sku_code",
+        "product_name",
+        "category",
+        "match_confidence",
+        "match_provenance",
+        "current_price_inr",
+        "kestrel_mrp_inr",
+        "observed_pack_value",
+        "observed_pack_uom",
+        "kestrel_pack_value",
+        "kestrel_pack_uom",
+        "unit_price_basis",
+        "competitor_unit_price_inr",
+        "kestrel_mrp_unit_inr",
+        "unit_price_gap_inr",
+        "mrp_premium_pct",
+        "last_seen",
+    ]
+    dataframe_or_empty(
+        scoped_all_matches[
+            [column for column in all_match_columns if column in scoped_all_matches]
+        ],
+        empty_title="No qualifying current matches",
+        empty_body=(
+            all_matches_result.message
+            if not all_matches_result.available
+            else "No current listing clears the selected city, retailer, category, and pack "
+            "governance rules."
+        ),
+        max_rows=1000,
+        column_config={
+            "match_confidence": st.column_config.NumberColumn(
+                "Match confidence", format="%.3f"
+            ),
+            "current_price_inr": st.column_config.NumberColumn(
+                "Observed pack price", format="₹%.2f"
+            ),
+            "kestrel_mrp_inr": st.column_config.NumberColumn(
+                "Kestrel MRP", format="₹%.2f"
+            ),
+            "competitor_unit_price_inr": st.column_config.NumberColumn(
+                "Observed unit price", format="₹%.2f"
+            ),
+            "kestrel_mrp_unit_inr": st.column_config.NumberColumn(
+                "Kestrel MRP / unit", format="₹%.2f"
+            ),
+            "unit_price_gap_inr": st.column_config.NumberColumn(
+                "Unit-price gap", format="₹%.2f"
+            ),
+            "mrp_premium_pct": st.column_config.NumberColumn(
+                "MRP premium", format="%.1f%%"
+            ),
+            "last_seen": st.column_config.DateColumn(
+                "Latest observed", format="DD MMM YYYY"
+            ),
+        },
+    )
+    if not scoped_all_matches.empty:
+        render_source_note(
+            f"{len(scoped_all_matches):,} current qualifying listing match(es) in "
+            f"{market_scope}; this table is not capped by dispatch-value rank."
+        )
+
+    section_header(
+        "Match-quality coverage",
+        "Every current listing remains visible by governed entity-resolution outcome; only "
+        "matched listings contribute to headline price gaps.",
+    )
     quality_display = quality.copy()
     if "average_confidence" in quality_display:
         quality_display["average_confidence"] = (
             pd.to_numeric(quality_display["average_confidence"], errors="coerce") * 100
         )
-    dataframe_or_empty(
-        quality_display,
-        empty_title="No match-quality evidence",
-        empty_body="No competitor entity-resolution snapshot is available.",
-        column_config={
-            "average_confidence": st.column_config.NumberColumn(
-                "Average confidence", format="%.1f%%"
-            ),
-        },
+    quality_columns = st.columns((1.35, 1))
+    with quality_columns[0]:
+        if quality_display.empty:
+            render_empty_state(
+                "No match-quality chart",
+                "No competitor entity-resolution snapshot is available.",
+            )
+        else:
+            figure = px.bar(
+                quality_display,
+                x="city",
+                y="listings",
+                color="match_status",
+                barmode="stack",
+                color_discrete_map={
+                    "matched": TEAL,
+                    "ambiguous": GOLD,
+                    "low_confidence": RED,
+                    "unmatched": NAVY,
+                },
+                title="Current listings by city and match outcome",
+            )
+            figure.update_xaxes(title=None)
+            figure.update_yaxes(title="Listings")
+            _plot(_figure_layout(figure, height=370))
+    with quality_columns[1]:
+        dataframe_or_empty(
+            quality_display,
+            empty_title="No match-quality evidence",
+            empty_body="No competitor entity-resolution snapshot is available.",
+            column_config={
+                "average_confidence": st.column_config.NumberColumn(
+                    "Average confidence", format="%.1f%%"
+                ),
+            },
+        )
+    _render_competitor_governance(
+        external.payload,
+        city,
+        retailer=retailer,
+        category=None if selected_category == "All categories" else selected_category,
+        matched_listings=scoped_all_matches,
+        source_coverage=scoped_source_coverage,
     )
-    _render_competitor_governance(external.payload, city)
     render_source_note(
         "Source: governed external snapshot of BazaarPulse observations and deterministic "
         "product-master matching. City and listing availability apply to the observation date."
     )
-    render_definitions(definitions, ["competitor_price_gap"])
+    render_definitions(
+        definitions,
+        ["competitor_price_gap", "competitor_match_coverage"],
+    )
     _render_external_context(settings, context)
 
 
@@ -2210,7 +3982,9 @@ def render_data_trust(
     render_callout(
         "External attribution is limited",
         "Freight has no delivery key and competitor listings have no Kestrel SKU key. Aggregation "
-        "and high-confidence matching boundaries remain visible wherever those sources appear.",
+        "and high-confidence matching boundaries remain visible wherever those sources appear. "
+        "For freight, 36,370 of 41,500 invoice warehouse-route pairs conflict with the route "
+        "master, so DC and route ratios are governed as separate lenses.",
         tone="warning",
     )
 
@@ -2224,7 +3998,13 @@ def render_data_trust(
                 "Formula": definition.formula,
                 "Grain": definition.grain,
                 "Date basis": definition.date_basis,
+                "Allowed dimensions": ", ".join(definition.allowed_dimensions),
+                "Exclusions": "; ".join(definition.exclusions),
+                "Source models": ", ".join(definition.source_models),
                 "Warning": definition.warning,
+                "Interpretation limits": "; ".join(
+                    definition.interpretation_limits
+                ),
             }
             for definition in definitions.values()
         ]

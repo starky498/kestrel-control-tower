@@ -24,7 +24,16 @@ _FILTER_WIDGET_KEYS = (
     "kp_route_codes",
     "kp_outlet_codes",
     "kp_channels",
+    "kp_promotion_codes",
+    "kp_order_sources",
 )
+
+
+def _reset_filter_state() -> None:
+    """Clear widget values in Streamlit's pre-rerun callback phase."""
+
+    for key in _FILTER_WIDGET_KEYS:
+        st.session_state.pop(key, None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +58,8 @@ class FilterContext:
             ("Route", self.filters.route_codes),
             ("Outlet", self.filters.outlet_codes),
             ("Channel", self.filters.channels),
+            ("Promotion", self.filters.promotion_codes),
+            ("Order source", self.filters.order_sources),
         )
         for label, values in groups:
             if len(values) == 1:
@@ -70,6 +81,8 @@ def with_dates(filters: FilterSet, period: Period) -> FilterSet:
         route_codes=filters.route_codes,
         outlet_codes=filters.outlet_codes,
         channels=filters.channels,
+        promotion_codes=filters.promotion_codes,
+        order_sources=filters.order_sources,
     )
 
 
@@ -178,15 +191,28 @@ def render_global_filters(service: AnalyticsService) -> FilterContext:
             "kp_outlet_codes",
             "Only eligible active, non-test outlets contribute to service KPIs.",
         )
+        promotion_codes = _multi_select(
+            "Recorded promotion",
+            options.get("promotion_codes", []),
+            "kp_promotion_codes",
+            "Promotion code recorded on the order; association does not imply causal uplift.",
+        )
+        order_sources = _multi_select(
+            "Order source",
+            options.get("order_sources", []),
+            "kp_order_sources",
+            "Source system recorded on the order and retained through service evidence.",
+        )
 
     st.sidebar.caption(
         f"Available service dates: {minimum:%d %b %Y} – {maximum:%d %b %Y}. "
         "Inventory and external sources carry their own as-of dates."
     )
-    if st.sidebar.button("Reset all filters", width="stretch"):
-        for key in _FILTER_WIDGET_KEYS:
-            st.session_state.pop(key, None)
-        st.rerun()
+    st.sidebar.button(
+        "Reset all filters",
+        width="stretch",
+        on_click=_reset_filter_state,
+    )
 
     return FilterContext(
         filters=FilterSet(
@@ -198,6 +224,8 @@ def render_global_filters(service: AnalyticsService) -> FilterContext:
             route_codes=route_codes,
             outlet_codes=outlet_codes,
             channels=channels,
+            promotion_codes=promotion_codes,
+            order_sources=order_sources,
         ),
         basis=basis_value,
         period_label=period.label,
