@@ -138,6 +138,7 @@ def test_complete_freight_snapshot_preserves_source_and_converted_units(
     )
 
     summary = store_freight_snapshot(database, (invoice,), metadata)
+    store_freight_snapshot(database, (invoice,), metadata)
 
     assert summary.coverage_start == date(2026, 6, 14)
     with duckdb.connect(str(database), read_only=True) as connection:
@@ -148,6 +149,9 @@ def test_complete_freight_snapshot_preserves_source_and_converted_units(
             FROM ext_freight_invoice_current
             """
         ).fetchone()
+        sync_rows = connection.execute(
+            "SELECT count(*) FROM external_sync_runs WHERE source_name = 'freight_api'"
+        ).fetchone()[0]
     assert row[:4] == (
         12_345,
         Decimal("123.45"),
@@ -155,6 +159,7 @@ def test_complete_freight_snapshot_preserves_source_and_converted_units(
         Decimal("125.95"),
     )
     assert row[4].isoformat().startswith("2026-06-16T01:45:00")
+    assert sync_rows == 1
 
 
 def test_incomplete_freight_snapshot_is_never_published(tmp_path: Path) -> None:

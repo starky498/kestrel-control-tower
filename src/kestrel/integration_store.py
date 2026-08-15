@@ -121,6 +121,8 @@ def store_bazaarpulse_snapshot(
         _register_frame(connection, "_bazaarpulse_matches", match_records)
         connection.execute("BEGIN TRANSACTION")
         _ensure_sync_table(connection)
+        sync_id = f"bazaarpulse-{completed.isoformat()}"
+        connection.execute("DELETE FROM external_sync_runs WHERE sync_id = ?", [sync_id])
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS ext_bazaarpulse_listing_current AS
@@ -187,7 +189,7 @@ def store_bazaarpulse_snapshot(
             INSERT INTO external_sync_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                f"bazaarpulse-{completed.isoformat()}",
+                sync_id,
                 "bazaarpulse",
                 "SUCCEEDED",
                 len(listings),
@@ -284,6 +286,8 @@ def store_freight_snapshot(
         _register_frame(connection, "_freight_invoices", records)
         connection.execute("BEGIN TRANSACTION")
         _ensure_sync_table(connection)
+        sync_id = f"freight-{metadata.completed_at_utc.isoformat()}"
+        connection.execute("DELETE FROM external_sync_runs WHERE sync_id = ?", [sync_id])
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS ext_freight_invoice_current AS
@@ -299,7 +303,7 @@ def store_freight_snapshot(
             INSERT INTO external_sync_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                f"freight-{metadata.completed_at_utc.isoformat()}",
+                sync_id,
                 "freight_api",
                 "SUCCEEDED",
                 len(invoices),

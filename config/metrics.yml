@@ -26,7 +26,7 @@ on_time_rate:
   title: Timestamp-derived on-time rate
   formula: count(actual arrival <= planned arrival) / count(eligible deliveries)
   grain: Delivery
-  date_basis: Planned arrival date
+  date_basis: Requested delivery date
   eligible_population: Deliveries for eligible completed orders with parseable planned and actual timestamps
   numerator: On-time eligible deliveries
   denominator: Eligible deliveries with parseable timestamps
@@ -38,7 +38,7 @@ late_over_2h_rate:
   title: More-than-two-hours-late rate
   formula: count(timestamp-derived delay > 120 minutes) / count(eligible deliveries)
   grain: Delivery
-  date_basis: Planned arrival date
+  date_basis: Requested delivery date
   eligible_population: Eligible deliveries with parseable planned and actual timestamps
   numerator: Eligible deliveries more than 120 minutes late
   denominator: Eligible deliveries with parseable timestamps
@@ -50,7 +50,7 @@ temperature_excursions_per_100:
   title: Temperature excursions per 100 chilled deliveries
   formula: 100 * distinct chilled deliveries flagged with an excursion / distinct chilled deliveries
   grain: Delivery
-  date_basis: Planned arrival date
+  date_basis: Actual delivery date
   eligible_population: Eligible deliveries containing at least one chilled SKU
   numerator: Distinct chilled deliveries with temperature_excursion_flag = 1
   denominator: Distinct eligible chilled deliveries
@@ -83,16 +83,16 @@ approved_credit_note_rate:
   warning: This is measured gross commercial leakage, not accounting profit or cash collected.
 
 freight_cost_per_case:
-  title: Paid freight per delivered case-equivalent
-  formula: paid billed freight in rupees / delivered case-equivalents
+  title: Billed freight per delivered case-equivalent
+  formula: all-status billed freight in rupees / delivered case-equivalents
   grain: Independently aggregated period × warehouse or period × route
-  date_basis: Freight service date and requested delivery date
-  eligible_population: Paid freight invoices and eligible completed-order delivered case-equivalents
-  numerator: API invoice amount_paise / 100 for PAID invoices
+  date_basis: Freight service date and actual delivery date
+  eligible_population: All freight invoices and eligible completed-order delivered case-equivalents
+  numerator: API amount_paise / 100 plus detention_charge_paise / 100
   denominator: Delivered case-equivalents
   unit: INR_per_case
   status: estimated
-  warning: Freight has no order/delivery key; numerator and denominator are never joined invoice-to-delivery.
+  warning: Freight has no order/delivery key; numerator and denominator are never joined invoice-to-delivery. Paid, pending, and disputed components remain separate.
 
 competitor_price_gap:
   title: Observed market price gap

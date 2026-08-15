@@ -16,7 +16,7 @@ from kestrel.ingestion.bazaarpulse import (
     HttpSiteSource,
     match_listings_to_products,
 )
-from kestrel.ingestion.freight import FreightClient
+from kestrel.ingestion.freight import FreightClient, load_last_good_cache
 from kestrel.integration_store import (
     load_product_candidates,
     store_bazaarpulse_snapshot,
@@ -178,6 +178,11 @@ def sync_freight(
         "--resume/--no-resume",
         help="Resume a compatible interrupted cursor walk.",
     ),
+    offline_cache: bool = typer.Option(
+        False,
+        "--offline-cache",
+        help="Publish the validated last-good cache without calling the API.",
+    ),
 ) -> None:
     """Synchronize carrier invoices with retry, resume, and last-good protection."""
 
@@ -189,6 +194,19 @@ def sync_freight(
     except (ConfigurationError, ValueError) as error:
         typer.echo(f"Invalid freight sync configuration: {error}", err=True)
         raise typer.Exit(code=2) from error
+    if offline_cache:
+        try:
+            cache = load_last_good_cache(settings.freight_cache)
+            summary = store_freight_snapshot(analytics_db, cache.invoices, cache.metadata)
+        except Exception as error:
+            typer.echo(f"Could not publish freight cache: {error}", err=True)
+            raise typer.Exit(code=1) from error
+        typer.echo(
+            f"Published {summary.record_count:,} validated cached invoices; last successful "
+            f"sync={summary.completed_at_utc.isoformat()}."
+        )
+        return
+
     if not settings.freight_api_key:
         typer.echo(
             "KESTREL_FREIGHT_API_KEY is not configured. Copy the supplied mock-server key "
@@ -215,11 +233,20 @@ def sync_freight(
             f"{result.metadata.retry_count:,} retries: {result.metadata.error}",
             err=True,
         )
-        typer.echo(
-            "Cursor checkpoint saved; the previous last-good cache and analytical snapshot "
-            "were preserved.",
-            err=True,
-        )
+        if result.last_good_available:
+            cache = load_last_good_cache(settings.freight_cache)
+            stale = store_freight_snapshot(analytics_db, cache.invoices, cache.metadata)
+            typer.echo(
+                "Cursor checkpoint saved. Published the validated last-good snapshot from "
+                f"{stale.completed_at_utc.isoformat()}; it is stale and labeled accordingly.",
+                err=True,
+            )
+        else:
+            typer.echo(
+                "Cursor checkpoint saved; no complete cache is available. The previous "
+                "analytical snapshot, if any, was preserved.",
+                err=True,
+            )
         raise typer.Exit(code=1)
 
     summary = store_freight_snapshot(analytics_db, result.invoices, result.metadata)
