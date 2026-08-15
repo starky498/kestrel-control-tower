@@ -55,6 +55,24 @@ FROM raw_routes rt
 LEFT JOIN raw_warehouses w ON w.warehouse_id = rt.warehouse_id
 LEFT JOIN raw_regions r ON r.region_id = rt.region_id;
 
+CREATE TABLE dim_salesperson AS
+SELECT
+    CAST(s.salesperson_id AS BIGINT) AS salesperson_id,
+    s.employee_code,
+    s.full_name,
+    CAST(s.region_id AS BIGINT) AS salesperson_region_id,
+    r.region_code AS salesperson_region_code,
+    r.region_name AS salesperson_region_name,
+    s.designation,
+    CAST(s.date_of_joining AS DATE) AS date_of_joining,
+    CAST(s.date_of_exit AS DATE) AS date_of_exit,
+    s.target_monthly_inr,
+    s.incentive_band,
+    CAST(s.reports_to AS BIGINT) AS reports_to_salesperson_id,
+    s.status AS salesperson_status
+FROM raw_salespeople s
+LEFT JOIN raw_regions r ON r.region_id = s.region_id;
+
 CREATE TABLE dim_outlet AS
 SELECT
     CAST(o.outlet_id AS BIGINT) AS outlet_id,

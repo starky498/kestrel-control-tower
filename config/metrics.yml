@@ -1,4 +1,5 @@
 fill_rate:
+  version: "1.0.0"
   title: Fill rate
   formula: sum(delivered quantity) / sum(ordered quantity)
   grain: Order line, aggregated as a ratio of sums
@@ -11,6 +12,7 @@ fill_rate:
   warning: Eaches and case-equivalents are both available; eaches is the default.
 
 strict_otif:
+  version: "1.0.0"
   title: Strict OTIF
   formula: count(orders on time and strict in full) / count(eligible completed orders)
   grain: Order
@@ -23,6 +25,7 @@ strict_otif:
   warning: Every supplied order line is short-delivered, so strict in-full and strict OTIF are 0%.
 
 on_time_rate:
+  version: "1.0.0"
   title: Timestamp-derived on-time rate
   formula: count(actual arrival <= planned arrival) / count(eligible deliveries)
   grain: Delivery
@@ -35,6 +38,7 @@ on_time_rate:
   warning: Stored delay_minutes conflicts with parsed timestamps on 67,211 supplied deliveries and is shown separately.
 
 late_over_2h_rate:
+  version: "1.0.0"
   title: More-than-two-hours-late rate
   formula: count(timestamp-derived delay > 120 minutes) / count(eligible deliveries)
   grain: Delivery
@@ -47,6 +51,7 @@ late_over_2h_rate:
   warning: This uses parsed timestamps; the stored delay field is retained as a conflicting source signal.
 
 temperature_excursions_per_100:
+  version: "1.0.0"
   title: Temperature excursions per 100 chilled deliveries
   formula: 100 * distinct chilled deliveries flagged with an excursion / distinct chilled deliveries
   grain: Delivery
@@ -59,6 +64,7 @@ temperature_excursions_per_100:
   warning: The source flag is used because max_temp_celsius does not reliably explain the flag.
 
 near_expiry_cases:
+  version: "1.0.0"
   title: Near-expiry available cases
   formula: sum(available_cases where expiry date is within the configured future window)
   grain: Warehouse × SKU × batch × weekly snapshot
@@ -71,6 +77,7 @@ near_expiry_cases:
   warning: Inventory is weekly and current case packs are used upstream for on_hand_eaches.
 
 approved_credit_note_rate:
+  version: "1.0.0"
   title: Approved credit-note leakage rate
   formula: approved credit-note value / estimated delivered line value
   grain: Period-level ratio across separate return and order-line facts
@@ -83,6 +90,7 @@ approved_credit_note_rate:
   warning: This is measured gross commercial leakage, not accounting profit or cash collected.
 
 freight_cost_per_case:
+  version: "1.0.0"
   title: Billed freight per delivered case-equivalent
   formula: all-status billed freight in rupees / delivered case-equivalents
   grain: Independently aggregated period × warehouse or period × route
@@ -95,6 +103,7 @@ freight_cost_per_case:
   warning: Freight has no order/delivery key; numerator and denominator are never joined invoice-to-delivery. Paid, pending, and disputed components remain separate.
 
 competitor_price_gap:
+  version: "1.0.0"
   title: Observed market price gap
   formula: Kestrel current MRP - lowest latest observed in-stock competitor price
   grain: Matched Kestrel SKU × city
@@ -105,3 +114,107 @@ competitor_price_gap:
   unit: INR
   status: partial_coverage
   warning: BazaarPulse is refreshed weekly; results are latest observed, not live prices.
+
+allocation_rate:
+  version: "1.0.0"
+  title: Allocation rate
+  formula: sum(allocated quantity) / sum(ordered quantity)
+  grain: Order line, aggregated as a ratio of sums
+  date_basis: Requested delivery date
+  eligible_population: DELIVERED and PARTIAL orders for currently active, non-deleted, non-test outlets
+  numerator: Allocated eaches or allocated case-equivalents
+  denominator: Ordered eaches or ordered case-equivalents
+  unit: percent
+  status: verified
+  warning: This describes the recorded allocation gate; it does not identify why stock was not allocated.
+
+post_allocation_fulfilment:
+  version: "1.0.0"
+  title: Post-allocation fulfilment
+  formula: sum(delivered quantity) / sum(allocated quantity)
+  grain: Order line, aggregated as a ratio of sums
+  date_basis: Requested delivery date
+  eligible_population: DELIVERED and PARTIAL orders for currently active, non-deleted, non-test outlets with allocated quantity
+  numerator: Delivered eaches or delivered case-equivalents
+  denominator: Allocated eaches or allocated case-equivalents
+  unit: percent
+  status: verified
+  warning: This is a measured conversion after allocation, not causal attribution to a warehouse, route, or carrier.
+
+overdue_backlog_orders:
+  version: "1.0.0"
+  title: Overdue open-order backlog
+  formula: count(open eligible-outlet orders with requested delivery date on or before the reporting as-of date)
+  grain: Order as-of selected period end
+  date_basis: Requested delivery date, measured as of the selected period end
+  eligible_population: OPEN orders for currently active, non-deleted, non-test outlets
+  numerator: Overdue open orders
+  denominator: Not applicable
+  unit: orders
+  status: verified
+  warning: Backlog is a current source-state snapshot, not a historical reconstruction of order status at an earlier date.
+
+delivery_on_time_rate:
+  version: "1.0.0"
+  title: Delivery-cohort timestamp-derived on-time rate
+  formula: count(actual arrival <= planned arrival) / count(deliveries with parseable planned and actual timestamps)
+  grain: Delivery
+  date_basis: Actual delivery date
+  eligible_population: Deliveries for eligible completed orders with parseable planned and actual timestamps
+  numerator: On-time eligible deliveries
+  denominator: Eligible deliveries with parseable timestamps
+  unit: percent
+  status: proxy
+  warning: This operational exception view is grouped by actual delivery date; the executive service KPI uses requested delivery date.
+
+delivery_late_over_2h_rate:
+  version: "1.0.0"
+  title: Delivery-cohort more-than-two-hours-late rate
+  formula: count(timestamp-derived delay > 120 minutes) / count(deliveries with parseable planned and actual timestamps)
+  grain: Delivery
+  date_basis: Actual delivery date
+  eligible_population: Deliveries for eligible completed orders with parseable planned and actual timestamps
+  numerator: Eligible deliveries more than 120 minutes late
+  denominator: Eligible deliveries with parseable timestamps
+  unit: percent
+  status: proxy
+  warning: The threshold identifies exceptions for review and is not evidence of responsibility or cause.
+
+pod_coverage_rate:
+  version: "1.0.0"
+  title: Proof-of-delivery coverage
+  formula: count(deliveries with POD captured) / count(eligible deliveries)
+  grain: Delivery
+  date_basis: Actual delivery date
+  eligible_population: Deliveries for eligible completed orders
+  numerator: Eligible deliveries with pod_captured = true
+  denominator: Eligible deliveries
+  unit: percent
+  status: verified
+  warning: POD capture indicates recorded evidence coverage, not the quality or validity of the underlying document.
+
+delay_source_conflict_rate:
+  version: "1.0.0"
+  title: Delay-source conflict rate
+  formula: count(deliveries where stored delay differs from timestamp-derived delay by more than one minute or timestamps are unparseable) / count(eligible deliveries)
+  grain: Delivery
+  date_basis: Actual delivery date
+  eligible_population: Deliveries for eligible completed orders
+  numerator: Eligible deliveries with delay_source_conflict = true
+  denominator: Eligible deliveries
+  unit: percent
+  status: data_conflict
+  warning: This is a data-reconciliation signal; neither source is silently overwritten.
+
+recorded_failure_rate:
+  version: "1.0.0"
+  title: Recorded delivery-failure signal rate
+  formula: count(deliveries with a non-empty failure reason code) / count(eligible deliveries)
+  grain: Delivery
+  date_basis: Actual delivery date
+  eligible_population: Deliveries for eligible completed orders
+  numerator: Eligible deliveries with a recorded failure_reason_code
+  denominator: Eligible deliveries
+  unit: percent
+  status: verified
+  warning: A recorded reason is an associated source-system label and does not establish root cause or blame.

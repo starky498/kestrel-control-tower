@@ -11,6 +11,7 @@ import yaml
 @dataclass(frozen=True)
 class MetricDefinition:
     key: str
+    version: str
     title: str
     formula: str
     grain: str

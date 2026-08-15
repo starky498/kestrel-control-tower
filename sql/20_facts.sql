@@ -34,6 +34,11 @@ SELECT
     CAST(o.route_id AS BIGINT) AS route_id,
     route.route_code,
     route.route_name,
+    CAST(o.salesperson_id AS BIGINT) AS salesperson_id,
+    salesperson.employee_code AS salesperson_employee_code,
+    salesperson.full_name AS salesperson_name,
+    salesperson.designation AS salesperson_designation,
+    salesperson.salesperson_region_name,
     CAST(ol.product_id AS BIGINT) AS product_id,
     product.sku_code,
     product.product_name,
@@ -63,6 +68,26 @@ SELECT
          ELSE ol.allocated_qty / nullif(ol.case_pack_at_order, 0) END AS allocated_case_equivalents,
     CASE WHEN ol.qty_uom = 'CASE' THEN ol.delivered_qty
          ELSE ol.delivered_qty / nullif(ol.case_pack_at_order, 0) END AS delivered_case_equivalents,
+    greatest(
+        CASE WHEN ol.qty_uom = 'CASE' THEN (ol.ordered_qty - ol.allocated_qty) * ol.case_pack_at_order
+             ELSE ol.ordered_qty - ol.allocated_qty END,
+        0
+    ) AS allocation_short_eaches,
+    greatest(
+        CASE WHEN ol.qty_uom = 'CASE' THEN (ol.allocated_qty - ol.delivered_qty) * ol.case_pack_at_order
+             ELSE ol.allocated_qty - ol.delivered_qty END,
+        0
+    ) AS post_allocation_short_eaches,
+    greatest(
+        CASE WHEN ol.qty_uom = 'CASE' THEN ol.ordered_qty - ol.allocated_qty
+             ELSE (ol.ordered_qty - ol.allocated_qty) / nullif(ol.case_pack_at_order, 0) END,
+        0
+    ) AS allocation_short_case_equivalents,
+    greatest(
+        CASE WHEN ol.qty_uom = 'CASE' THEN ol.allocated_qty - ol.delivered_qty
+             ELSE (ol.allocated_qty - ol.delivered_qty) / nullif(ol.case_pack_at_order, 0) END,
+        0
+    ) AS post_allocation_short_case_equivalents,
     greatest(
         CASE WHEN ol.qty_uom = 'CASE' THEN (ol.ordered_qty - ol.delivered_qty) * ol.case_pack_at_order
              ELSE ol.ordered_qty - ol.delivered_qty END,
@@ -98,6 +123,7 @@ JOIN dim_product product ON product.product_id = ol.product_id
 LEFT JOIN dim_region customer_region ON customer_region.region_id = o.region_id
 LEFT JOIN dim_warehouse warehouse ON warehouse.warehouse_id = o.warehouse_id
 LEFT JOIN dim_route route ON route.route_id = o.route_id
+LEFT JOIN dim_salesperson salesperson ON salesperson.salesperson_id = o.salesperson_id
 LEFT JOIN raw_product_price_history historical_price
     ON historical_price.product_id = ol.product_id
    AND CAST(o.order_date AS DATE) >= CAST(historical_price.effective_from AS DATE)
@@ -220,15 +246,25 @@ WITH line_rollup AS (
         any_value(route_id) AS route_id,
         any_value(route_code) AS route_code,
         any_value(route_name) AS route_name,
+        any_value(salesperson_id) AS salesperson_id,
+        any_value(salesperson_employee_code) AS salesperson_employee_code,
+        any_value(salesperson_name) AS salesperson_name,
+        any_value(salesperson_designation) AS salesperson_designation,
+        any_value(salesperson_region_name) AS salesperson_region_name,
+        any_value(is_eligible_service_outlet) AS is_eligible_service_outlet,
         any_value(is_eligible_service) AS is_eligible_service,
         count(*) AS line_count,
         sum(ordered_eaches) AS ordered_eaches,
         sum(allocated_eaches) AS allocated_eaches,
         sum(delivered_eaches) AS delivered_eaches,
+        sum(allocation_short_eaches) AS allocation_short_eaches,
+        sum(post_allocation_short_eaches) AS post_allocation_short_eaches,
         sum(short_eaches) AS short_eaches,
         sum(ordered_case_equivalents) AS ordered_case_equivalents,
         sum(allocated_case_equivalents) AS allocated_case_equivalents,
         sum(delivered_case_equivalents) AS delivered_case_equivalents,
+        sum(allocation_short_case_equivalents) AS allocation_short_case_equivalents,
+        sum(post_allocation_short_case_equivalents) AS post_allocation_short_case_equivalents,
         sum(short_case_equivalents) AS short_case_equivalents,
         sum(line_value_inr) AS line_value_inr,
         sum(estimated_dispatch_value_inr) AS estimated_dispatch_value_inr,
