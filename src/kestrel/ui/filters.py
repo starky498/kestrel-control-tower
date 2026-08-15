@@ -146,7 +146,7 @@ def render_global_filters(service: AnalyticsService) -> FilterContext:
             "Customer region",
             options["customer_regions"],
             "kp_customer_regions",
-            "Sales/customer geography. This is the default meaning of region.",
+            "Sales/customer geography. Ask Kestrel requires this lens to be explicit.",
         )
         warehouse_regions = _multi_select(
             "DC region",

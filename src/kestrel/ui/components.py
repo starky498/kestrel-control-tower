@@ -314,7 +314,9 @@ def render_definitions(
         return
     with st.expander(label, expanded=False):
         for definition in available:
-            st.markdown(f"**{definition.title}** · `{definition.status}`")
+            st.markdown(
+                f"**{definition.title}** · `v{definition.version}` · `{definition.status}`"
+            )
             st.caption(
                 f"Formula: {definition.formula}  |  Grain: {definition.grain}  |  "
                 f"Date basis: {definition.date_basis}"

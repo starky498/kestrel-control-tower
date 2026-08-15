@@ -264,6 +264,8 @@ class ExternalMetricService(Protocol):
 
     def freight_by_warehouse(self, filters: FilterSet) -> pd.DataFrame: ...
 
+    def freight_by_route(self, filters: FilterSet) -> pd.DataFrame: ...
+
     def competitor_price_gap(
         self,
         filters: FilterSet,
@@ -560,11 +562,16 @@ def _detect_metrics(text: str) -> tuple[MetricKey, ...]:
 
 def _detect_dimensions(text: str) -> tuple[DimensionKey, ...]:
     dimensions: list[DimensionKey] = []
-    warehouse_region = bool(re.search(r"\b(?:warehouse|dc|distribution centre) regions?\b", text))
+    warehouse_region = bool(
+        re.search(
+            r"\b(?:by|per|across)\s+(?:warehouse|dc|distribution centre) regions?\b",
+            text,
+        )
+    )
     if warehouse_region:
         dimensions.append(DimensionKey.WAREHOUSE_REGION)
-    if re.search(r"\bby (?:customer |sales )?regions?\b", text) or re.search(
-        r"\bcustomer regions?\b", text
+    if re.search(
+        r"\b(?:by|per|across)\s+(?:customer |sales )?regions?\b", text
     ):
         dimensions.append(DimensionKey.CUSTOMER_REGION)
     if not warehouse_region and re.search(
@@ -576,8 +583,13 @@ def _detect_dimensions(text: str) -> tuple[DimensionKey, ...]:
     if re.search(r"\b(?:by|per|across)\s+routes?\b", text):
         dimensions.append(DimensionKey.ROUTE)
     if re.search(
-        r"\b(?:by|per|across)\s+(?:outlets?|customers?)(?!\s+regions?\b)", text
-    ) or re.search(r"\bwhich(?:\s+\w+){0,2}\s+(?:outlets?|customers?)\b", text):
+        r"\b(?:by|per|across)\s+(?:outlets?|customers?|stores?)(?!\s+regions?\b)",
+        text,
+    ) or re.search(
+        r"\b(?:which|show|give|rank)(?:\s+\w+){0,4}\s+"
+        r"(?:outlets?|customers?|stores?)\b",
+        text,
+    ):
         dimensions.append(DimensionKey.OUTLET)
     if re.search(r"\b(?:by|per|across)\s+channels?\b", text):
         dimensions.append(DimensionKey.CHANNEL)
@@ -619,6 +631,15 @@ def _extract_limit(text: str, metric: MetricKey) -> int | None:
         raw = match.group(1)
         limit = int(raw) if raw.isdigit() else _NUMBER_WORDS[raw]
         return min(max(limit, 1), 100)
+    reverse_match = re.search(
+        r"\b(\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten|twenty|"
+        r"fifty|hundred)\s+(?:lowest|highest|worst|best|bottom|top|poorest)\b",
+        text,
+    )
+    if reverse_match:
+        raw = reverse_match.group(1)
+        limit = int(raw) if raw.isdigit() else _NUMBER_WORDS[raw]
+        return min(max(limit, 1), 100)
     defaults = {
         MetricKey.MARKET_PRICE_GAP: 20,
         MetricKey.DISCONTINUED_SKUS: 100,
@@ -627,7 +648,7 @@ def _extract_limit(text: str, metric: MetricKey) -> int | None:
 
 
 def _extract_ranking(text: str) -> Ranking:
-    if re.search(r"\b(?:lowest|worst|bottom)\b", text):
+    if re.search(r"\b(?:lowest|worst|bottom|poorest)\b", text):
         return Ranking.WORST
     if re.search(r"\b(?:highest|best|top|largest)\b", text):
         return Ranking.BEST
@@ -665,22 +686,50 @@ def _extract_filters(text: str, options: dict[str, list[str]]) -> tuple[IntentFi
     warehouse_region_context = bool(
         re.search(r"\b(?:warehouse|dc|distribution centre) regions?\b", text)
     )
+    customer_region_context = bool(
+        re.search(r"\b(?:customer|sales) regions?\b", text)
+    )
+    if warehouse_region_context and customer_region_context:
+        return (
+            IntentFilters(),
+            "The question names both customer and DC/warehouse region contexts. "
+            "Ask for one regional lens at a time.",
+        )
     customer_regions: tuple[str, ...] = ()
     warehouse_regions: tuple[str, ...] = ()
-    region_options = options.get("customer_regions", [])
-    matched_regions = _matching_options(text, region_options)
+    customer_region_options = options.get("customer_regions", [])
+    warehouse_region_options = options.get("warehouse_regions", [])
+    matched_customer_regions = _matching_options(text, customer_region_options)
+    matched_warehouse_regions = _matching_options(text, warehouse_region_options)
     if warehouse_region_context:
-        warehouse_regions = _matching_options(
-            text, options.get("warehouse_regions", region_options)
-        )
-    else:
-        customer_regions = matched_regions
+        warehouse_regions = matched_warehouse_regions
+    elif customer_region_context:
+        customer_regions = matched_customer_regions
 
     unknown_region = re.search(r"\b(?:in|for)\s+([a-z][a-z -]+?)\s+region\b", text)
-    if unknown_region and not (customer_regions or warehouse_regions):
+    if unknown_region and not (matched_customer_regions or matched_warehouse_regions):
         candidate = unknown_region.group(1).strip()
         if candidate not in {"customer", "sales", "warehouse", "dc"}:
             return IntentFilters(), f"Unknown region '{candidate.title()}'."
+
+    if not (warehouse_region_context or customer_region_context):
+        if matched_customer_regions and matched_warehouse_regions:
+            names = ", ".join(
+                dict.fromkeys((*matched_customer_regions, *matched_warehouse_regions))
+            )
+            return (
+                IntentFilters(),
+                f"Does '{names}' mean customer region or DC/warehouse region? "
+                "State the regional lens explicitly; no metric query was run.",
+            )
+        if re.search(r"\b(?:by|per|across)\s+regions?\b", text):
+            return (
+                IntentFilters(),
+                "Does 'region' mean customer region or DC/warehouse region? "
+                "State the regional lens explicitly; no metric query was run.",
+            )
+        customer_regions = matched_customer_regions
+        warehouse_regions = matched_warehouse_regions
 
     warehouse_codes = tuple(
         dict.fromkeys(code.upper() for code in re.findall(r"\bwh\d{2}\b", text))
@@ -1382,7 +1431,12 @@ class QuestionRouter:
         if self.external_service is None:
             raise RuntimeError("External metrics were not supplied")
         filters = intent.filters.to_metric_filters(intent.period)
-        frame = self.external_service.freight_by_warehouse(filters)
+        by_route = DimensionKey.ROUTE in intent.dimensions
+        frame = (
+            self.external_service.freight_by_route(filters)
+            if by_route
+            else self.external_service.freight_by_warehouse(filters)
+        )
         unavailable_reason = frame.attrs.get("unavailable_reason")
         if frame.empty and unavailable_reason:
             spec = _SPECS[intent.metric]
@@ -1401,7 +1455,7 @@ class QuestionRouter:
         if intent.limit is not None:
             frame = frame.head(intent.limit)
         evidence = _frame_evidence(
-            "Billed freight per delivered case by warehouse",
+            "Billed freight per delivered case by " + ("route" if by_route else "warehouse"),
             "partner freight invoices",
             frame,
         )
@@ -1409,8 +1463,9 @@ class QuestionRouter:
             summary = "No freight and delivered-case evidence was found."
         else:
             first = frame.iloc[0]
+            dimension_column = "route_code" if by_route else "warehouse_code"
             summary = (
-                f"{first['warehouse_code']} has the highest billed freight per delivered "
+                f"{first[dimension_column]} has the highest billed freight per delivered "
                 f"case at ₹{_format_number(first['freight_cost_per_delivered_case_inr'])}."
             )
         attribution = frame.attrs.get("attribution")

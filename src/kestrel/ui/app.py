@@ -16,6 +16,7 @@ from kestrel.ui.pages import (
     render_ask,
     render_cold_chain,
     render_data_trust,
+    render_delivery_exceptions,
     render_executive,
     render_leakage,
     render_market,
@@ -27,13 +28,14 @@ PageRenderer = Callable[
 ]
 
 PAGES: dict[str, PageRenderer] = {
-    "Executive Control Tower": render_executive,
+    "Executive Command Center": render_executive,
     "Service & Fulfilment": render_service,
-    "Cold Chain & Inventory": render_cold_chain,
-    "Measured Leakage & Freight": render_leakage,
-    "Market Position": render_market,
+    "Delivery & Exception Drivers": render_delivery_exceptions,
+    "Cold Chain & Inventory Risk": render_cold_chain,
+    "Commercial Leakage & Logistics Cost": render_leakage,
+    "Market & External Context": render_market,
     "Ask Kestrel": render_ask,
-    "Data Trust": render_data_trust,
+    "Trust Center": render_data_trust,
 }
 
 

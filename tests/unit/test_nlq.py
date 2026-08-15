@@ -11,6 +11,7 @@ from kestrel.nlq import (
     MetricKey,
     ParseStatus,
     QuestionRouter,
+    Ranking,
     answer_question,
 )
 
@@ -204,6 +205,18 @@ class FakeExternalMetricService:
         frame.attrs["attribution"] = "Aggregated independently at service-period × warehouse."
         return frame
 
+    def freight_by_route(self, filters: FilterSet) -> pd.DataFrame:
+        frame = pd.DataFrame(
+            {
+                "route_code": ["RT0002", "RT0001"],
+                "freight_cost_inr": [900.0, 600.0],
+                "delivered_case_equivalents": [30.0, 30.0],
+                "freight_cost_per_delivered_case_inr": [30.0, 20.0],
+            }
+        )
+        frame.attrs["attribution"] = "Aggregated independently at service-period × route."
+        return frame
+
     def competitor_price_gap(
         self,
         filters: FilterSet,
@@ -233,7 +246,7 @@ def test_fill_rate_by_warehouse_parses_filters_basis_and_relative_month() -> Non
     router, service = _router()
 
     answer = router.answer(
-        "Which five warehouses had the lowest case fill rate last month in West region?"
+        "Which five warehouses had the lowest case fill rate last month in West customer region?"
     )
 
     assert answer.status == AnswerStatus.OK
@@ -287,7 +300,7 @@ def test_illustrative_lowest_outlets_question_routes_to_outlet_breakdown() -> No
 def test_why_fill_rate_question_compares_periods_and_returns_measured_contributors() -> None:
     router, service = _router()
 
-    answer = router.answer("Why did fill rate drop in West in FY 2026-27 Q1?")
+    answer = router.answer("Why did fill rate drop in West customer region in FY 2026-27 Q1?")
 
     assert answer.status == AnswerStatus.OK
     assert answer.intent is not None and answer.intent.explain_change
@@ -417,6 +430,19 @@ def test_optional_external_service_answers_price_and_freight_when_available() ->
     assert "independently" in freight.warnings[0]
 
 
+def test_optional_external_service_answers_freight_at_route_grain() -> None:
+    service = FakeMetricService()
+    router = QuestionRouter(service, FakeExternalMetricService())
+
+    answer = router.answer("Freight cost per delivered case by route in Q1")
+
+    assert answer.status == AnswerStatus.OK
+    assert answer.intent is not None
+    assert answer.intent.dimensions == (DimensionKey.ROUTE,)
+    assert "RT0002" in answer.summary
+    assert "service-period × route" in answer.warnings[0]
+
+
 def test_discontinued_sku_question_returns_row_level_evidence() -> None:
     router, service = _router()
 
@@ -454,6 +480,48 @@ def test_unknown_question_and_unknown_filter_fail_transparently() -> None:
     assert unsupported.status == AnswerStatus.UNSUPPORTED
     assert ambiguous.status == AnswerStatus.AMBIGUOUS
     assert "Unknown region" in ambiguous.summary
+
+
+def test_unqualified_region_name_requires_customer_or_dc_clarification() -> None:
+    router, service = _router()
+
+    answer = router.answer("What was fill rate in West region last month?")
+
+    assert answer.status == AnswerStatus.AMBIGUOUS
+    assert "customer region or DC/warehouse region" in answer.summary
+    assert answer.interpretation == "No metric query was executed."
+    analytical_calls = [
+        call
+        for call in service.calls
+        if call[0] not in {"available_date_range", "filter_options"}
+    ]
+    assert analytical_calls == []
+
+
+def test_outlet_ranking_paraphrase_preserves_dimension_limit_and_basis() -> None:
+    router, _ = _router()
+
+    parsed = router.parse(
+        "Show me the five worst stores by case fill rate last month"
+    )
+
+    assert parsed.status == ParseStatus.READY
+    assert parsed.intent is not None
+    assert parsed.intent.dimensions == (DimensionKey.OUTLET,)
+    assert parsed.intent.ranking == Ranking.WORST
+    assert parsed.intent.limit == 5
+    assert parsed.intent.quantity_basis == QuantityBasis.CASE_EQUIVALENTS
+
+
+def test_explicit_dc_region_resolves_to_warehouse_geography() -> None:
+    router, _ = _router()
+
+    answer = router.answer("What was fill rate in West DC region last month?")
+
+    assert answer.status == AnswerStatus.OK
+    assert answer.intent is not None
+    assert answer.intent.filters.customer_regions == ()
+    assert answer.intent.filters.warehouse_regions == ("West",)
 
 
 def test_out_of_range_explicit_period_is_not_silently_clamped() -> None:
