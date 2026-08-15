@@ -129,10 +129,10 @@ temperature_excursions_per_100:
   unit: per_100
   status: proxy
   warning: The source flag is used because max_temp_celsius does not reliably explain the flag.
-  allowed_dimensions: [warehouse_region, warehouse, route, category, month, promotion, order_source]
+  allowed_dimensions: [customer_region, warehouse_region, warehouse, route, outlet, channel, category, month, promotion, order_source]
   exclusions: [Ineligible deliveries, deliveries without chilled SKUs]
   source_models: [fct_delivery, fct_order_service, fct_order_line, dim_product]
-  interpretation_limits: [The source flag and descriptive temperature bands are not validated food-safety thresholds or proof of cause.]
+  interpretation_limits: [The source flag and descriptive temperature bands are not validated food-safety thresholds or proof of cause., Ranked dimensional views use a visible minimum chilled-delivery denominator while the monthly trend remains unfiltered.]
 
 near_expiry_cases:
   version: "1.0.0"
@@ -157,16 +157,16 @@ approved_credit_note_rate:
   formula: approved credit-note value / estimated delivered line value
   grain: Period-level ratio across separate return and order-line facts
   date_basis: Return date for credit notes; requested delivery date for delivered value
-  eligible_population: Approved credit notes and eligible completed-order dispatch estimates
+  eligible_population: All approved source credit-note lines matching the return filters and eligible completed-order dispatch estimates
   numerator: Approved credit_note_value_inr
   denominator: Per-line min(delivered, ordered) quantity × booked unit price × (1 - booked line discount)
   unit: percent
   status: estimated
   warning: This is measured gross commercial leakage, not accounting profit or cash collected.
-  allowed_dimensions: [customer_region, warehouse_region, warehouse, route, outlet, channel, category, sku, return_reason, disposition, credit_status, promotion, order_source]
+  allowed_dimensions: [customer_region, warehouse_region, warehouse, route, outlet, channel, category, sku, reason, disposition, status, promotion, promotion_mechanic, order_source]
   exclusions: [Pending or rejected notes from the numerator, ineligible order lines from the denominator]
   source_models: [fct_return_credit_note, fct_order_line]
-  interpretation_limits: [Separate return-date and requested-date facts are aggregated independently; this is not accounting profit or cash recovery.]
+  interpretation_limits: [The approved-credit numerator does not inherit completed-service eligibility; numerator and denominator are separate populations on separate date bases, and this is not accounting profit or cash recovery.]
 
 approved_credit_note_value_inr:
   version: "1.0.0"
@@ -180,13 +180,13 @@ approved_credit_note_value_inr:
   unit: INR
   status: verified
   warning: Workflow approval does not prove cash settlement, inventory recovery, vendor reimbursement, or accounting loss.
-  allowed_dimensions: [customer_region, warehouse_region, warehouse, route, outlet, channel, category, sku, return_reason, disposition, promotion, order_source]
+  allowed_dimensions: [customer_region, warehouse_region, warehouse, route, outlet, channel, category, sku, reason, disposition, promotion, promotion_mechanic, order_source]
   exclusions: [Pending and rejected credit-note lines]
   source_models: [fct_return_credit_note]
   interpretation_limits: [Approved value is the primary measured leakage component, not profit, loss, or collected cash.]
 
 freight_cost_per_case:
-  version: "1.0.0"
+  version: "1.1.0"
   title: Billed freight per delivered case-equivalent
   formula: all-status billed freight in rupees / delivered case-equivalents
   grain: Independently aggregated period × warehouse or period × route
@@ -196,14 +196,14 @@ freight_cost_per_case:
   denominator: Delivered case-equivalents
   unit: INR_per_case
   status: estimated
-  warning: Freight has no order/delivery key; numerator and denominator are never joined invoice-to-delivery. Paid, pending, and disputed components remain separate.
+  warning: The selected period is intersected with observed invoice service-date coverage, and that effective period constrains both invoice service dates and eligible actual-delivery dates. Freight has no order/delivery key; numerator and denominator are never joined invoice-to-delivery. Paid, pending, and disputed components remain separate.
   allowed_dimensions: &freight_dimensions [warehouse_region, warehouse, route, invoice_status, carrier]
   exclusions: &freight_exclusions [Driver-entered fuel cost, customer outlet channel promotion and order-source attribution, invoice-to-delivery joins]
   source_models: &freight_models [ext_freight_invoice_current, fct_order_service, dim_warehouse, dim_route]
-  interpretation_limits: [DC and route are independent period lenses because most invoice warehouse-route pairs conflict with the route master; no carrier-to-case attribution.]
+  interpretation_limits: [DC and route are independent period lenses because most invoice warehouse-route pairs conflict with the route master; no carrier-to-case attribution; a selected period wholly outside freight coverage is unavailable rather than zero.]
 
 settled_freight_cost_per_case:
-  version: "1.0.0"
+  version: "1.1.0"
   title: Settled freight per delivered case-equivalent
   formula: PAID billed freight in rupees / delivered case-equivalents
   grain: Independently aggregated period × warehouse or period × route
@@ -213,11 +213,11 @@ settled_freight_cost_per_case:
   denominator: Delivered case-equivalents
   unit: INR_per_case
   status: estimated
-  warning: Freight has no order/delivery key; period × DC or route aggregates are compared without carrier-to-case attribution. Pending and disputed billed components remain visible separately.
+  warning: The selected period is intersected with observed invoice service-date coverage, and that effective period constrains both invoice service dates and eligible actual-delivery dates. Freight has no order/delivery key; period × DC or route aggregates are compared without carrier-to-case attribution. Pending and disputed billed components remain visible separately.
   allowed_dimensions: *freight_dimensions
   exclusions: *freight_exclusions
   source_models: *freight_models
-  interpretation_limits: [PAID is the primary settled view; pending and disputed invoices are secondary billed exposure and no cash-settlement timestamp is supplied.]
+  interpretation_limits: [PAID is the primary settled view; pending and disputed invoices are secondary billed exposure and no cash-settlement timestamp is supplied; a selected period wholly outside freight coverage is unavailable rather than zero.]
 
 competitor_price_gap:
   version: "1.0.0"

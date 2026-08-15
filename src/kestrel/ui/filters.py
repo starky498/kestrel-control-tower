@@ -137,7 +137,8 @@ def _multi_select(label: str, options: list[str], key: str, help_text: str) -> t
 def render_global_filters(service: AnalyticsService) -> FilterContext:
     """Render the single global scope used by every governed page."""
 
-    minimum, maximum = service.available_date_range()
+    service_minimum, service_maximum = service.available_date_range()
+    minimum, maximum = service.available_reporting_date_range()
     options = service.filter_options()
 
     st.sidebar.markdown("### Reporting scope")
@@ -205,8 +206,10 @@ def render_global_filters(service: AnalyticsService) -> FilterContext:
         )
 
     st.sidebar.caption(
-        f"Available service dates: {minimum:%d %b %Y} – {maximum:%d %b %Y}. "
-        "Inventory and external sources carry their own as-of dates."
+        f"Governed reporting dates: {minimum:%d %b %Y} – {maximum:%d %b %Y}. "
+        f"Requested-delivery service dates: {service_minimum:%d %b %Y} – "
+        f"{service_maximum:%d %b %Y}. Inventory and external sources retain their own "
+        "declared date bases."
     )
     st.sidebar.button(
         "Reset all filters",

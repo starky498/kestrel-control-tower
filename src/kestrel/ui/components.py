@@ -253,7 +253,13 @@ def format_metric_value(metric: MetricValue | None) -> str:
     if metric is None or metric.value is None:
         return "Not available"
     if metric.unit == "percent":
-        return f"{metric.value * 100:.1f}%"
+        percentage = metric.value * 100
+        absolute = abs(percentage)
+        if 0 < absolute < 0.001:
+            return "<0.001%" if percentage > 0 else ">-0.001%"
+        if 0 < absolute < 0.1:
+            return f"{percentage:.3f}%"
+        return f"{percentage:.1f}%"
     if metric.unit == "per_100":
         return f"{metric.value:.1f}"
     if metric.unit == "cases":

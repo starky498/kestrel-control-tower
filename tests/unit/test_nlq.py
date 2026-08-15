@@ -17,12 +17,19 @@ from kestrel.nlq import (
     answer_question,
     normalize_business_spelling,
 )
+from kestrel.nlq.router import _format_percent
 from kestrel.nlq.semantic import (
     ModelProvenance,
     SemanticResolution,
     SemanticStatus,
     load_intent_catalog,
 )
+
+
+def test_nlq_percent_format_matches_dashboard_precision() -> None:
+    assert _format_percent(0.0003330327) == "0.033%"
+    assert _format_percent(0.0000001) == "<0.001%"
+    assert _format_percent(0.0) == "0.0%"
 
 
 class FakeSemanticResolver:
@@ -370,17 +377,30 @@ class FakeMetricService:
         )
 
     def cold_chain_by_dimension(
-        self, filters: FilterSet, dimension: str, *, limit: int = 20
+        self,
+        filters: FilterSet,
+        dimension: str,
+        *,
+        min_chilled_deliveries: int = 1,
+        limit: int = 20,
     ) -> pd.DataFrame:
-        self.calls.append(("cold_chain_by_dimension", (filters, dimension, limit)))
-        return pd.DataFrame(
+        self.calls.append(
+            (
+                "cold_chain_by_dimension",
+                (filters, dimension, min_chilled_deliveries, limit),
+            )
+        )
+        frame = pd.DataFrame(
             {
                 "dimension_value": ["WH01", "WH02"],
                 "chilled_deliveries": [100, 100],
                 "excursions": [5, 2],
                 "excursions_per_100": [5.0, 2.0],
             }
-        ).head(limit)
+        )
+        return frame.loc[
+            frame["chilled_deliveries"] >= min_chilled_deliveries
+        ].head(limit)
 
     def returns_by_dimension(
         self,
@@ -426,9 +446,16 @@ class FakeMetricService:
         )
 
     def shortage_contributors(
-        self, filters: FilterSet, dimension: str, *, limit: int = 20
+        self,
+        filters: FilterSet,
+        dimension: str,
+        basis: QuantityBasis = QuantityBasis.EACHES,
+        *,
+        limit: int = 20,
     ) -> pd.DataFrame:
-        self.calls.append(("shortage_contributors", (filters, dimension, limit)))
+        self.calls.append(
+            ("shortage_contributors", (filters, dimension, basis, limit))
+        )
         labels = {
             "short_reason": ["SR01", "SR02"],
             "category": ["Dairy", "Snacks"],
@@ -621,6 +648,21 @@ def test_chilled_excursions_by_month_calls_summary_for_each_q1_month() -> None:
     assert "May 2026" in answer.summary
     summary_calls = [call for call in service.calls if call[0] == "executive_summary"]
     assert len(summary_calls) == 3
+    assert not any(call[0] == "cold_chain_by_dimension" for call in service.calls)
+
+
+def test_ranked_chilled_dimension_uses_governed_volume_floor_and_warning() -> None:
+    router, service = _router()
+
+    answer = router.answer("Which warehouse has the highest cold-chain excursion rate in Q1?")
+
+    assert answer.status == AnswerStatus.OK
+    calls = [call for call in service.calls if call[0] == "cold_chain_by_dimension"]
+    assert len(calls) == 1
+    assert calls[0][1][2] == 25
+    assert "100 chilled deliveries" in answer.summary
+    assert any("fewer than 25" in warning for warning in answer.warnings)
+    assert any("formula is unchanged" in warning for warning in answer.warnings)
 
 
 def test_late_route_threshold_is_strictly_more_than_ten_percent() -> None:

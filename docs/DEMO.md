@@ -152,8 +152,9 @@ Narrative:
 
 Actions:
 
-1. Show excursions per 100 chilled deliveries, its distinct-delivery denominator, monthly severity,
-   and maximum-temperature evidence by warehouse/route/category.
+1. Show excursions per 100 chilled deliveries, its distinct-delivery denominator, the unfiltered
+   monthly severity trend, and the default 25-delivery floor on ranked warehouse/route/category
+   hotspots.
 2. Show near-expiry cases, selected snapshot date, default 30-day window, and at-risk batch rows.
 3. Show exact RT06 lines, including order-line key, reason, workflow status, raw sign, normalized
    eaches/case-equivalents, value, and disposition.
@@ -161,6 +162,8 @@ Actions:
 Narrative:
 
 - A delivery is chilled when any associated order line contains a chilled SKU and counts once.
+- The hotspot floor changes which groups qualify, not the source-flag formula; Ask Kestrel uses the
+  same minimum 25 for ranked cold-chain dimensions.
 - Inventory is the latest weekly snapshot on or before period end; it is not interpolated or
   compared to today's clock.
 - The source excursion flag is retained because temperature maxima do not reliably reproduce it.
@@ -290,7 +293,7 @@ Narrative:
 Actions:
 
 1. Show operational range, analytical snapshot time, eligible records, and the 24-entry registry
-   with version `1.0.0`.
+   with 22 definitions at `1.0.0` and the two freight definitions at `1.1.0`.
 2. Show strict OTIF, geography, delay, freight-key, and competitor-key boundaries.
 3. Show the bounded recent operation events and external source readiness/sync history.
 4. In a terminal, open `.kestrel/parquet/manifest.json` and one redacted JSONL event if useful.

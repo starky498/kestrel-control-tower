@@ -9,7 +9,10 @@ def test_metric_registry_entries_have_explicit_semantic_versions() -> None:
     registry = load_metric_definitions(Path("config/metrics.yml"))
 
     assert len(registry) == 24
-    assert all(definition.version == "1.0.0" for definition in registry.values())
+    versions = {key: definition.version for key, definition in registry.items()}
+    assert sum(version == "1.0.0" for version in versions.values()) == 22
+    assert versions["freight_cost_per_case"] == "1.1.0"
+    assert versions["settled_freight_cost_per_case"] == "1.1.0"
     assert registry["allocation_rate"].unit == "percent"
     assert registry["overdue_backlog_orders"].grain.startswith("Order as-of")
     assert registry["fill_rate_eaches"].version == "1.0.0"
@@ -23,6 +26,12 @@ def test_metric_registry_entries_have_explicit_semantic_versions() -> None:
         "settled_freight_cost_per_case"
     ].source_models
     assert registry["competitor_match_coverage"].interpretation_limits
+    assert {"customer_region", "outlet", "channel"}.issubset(
+        registry["temperature_excursions_per_100"].allowed_dimensions
+    )
+    assert "promotion_mechanic" in registry[
+        "approved_credit_note_value_inr"
+    ].allowed_dimensions
 
 
 def test_metric_registry_rejects_an_entry_without_a_version(tmp_path: Path) -> None:
