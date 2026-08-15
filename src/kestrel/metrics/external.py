@@ -45,6 +45,14 @@ class ExternalAnalyticsService:
             return {
                 "freight": self._exists(connection, "ext_freight_invoice_current"),
                 "competitor": self._exists(connection, "ext_bazaarpulse_listing_current"),
+                "competitor_history": self._exists(
+                    connection, "ext_bazaarpulse_listing_history"
+                ),
+                "competitor_review_queue": self._exists(
+                    connection, "vw_competitor_match_review_queue"
+                ),
+                "weather": self._exists(connection, "ext_weather_daily_current"),
+                "holidays": self._exists(connection, "ext_india_holiday_current"),
                 "sync_history": self._exists(connection, "external_sync_runs"),
             }
 
@@ -261,6 +269,98 @@ class ExternalAnalyticsService:
         )
         return frame
 
+    def freight_by_route(self, filters: FilterSet) -> pd.DataFrame:
+        """Billed freight per delivered case-equivalent at independently aligned route grain."""
+
+        columns = [
+            "route_code",
+            "route_name",
+            "invoice_count",
+            "freight_cost_inr",
+            "detention_cost_inr",
+            "paid_cost_inr",
+            "pending_cost_inr",
+            "disputed_cost_inr",
+            "delivered_case_equivalents",
+            "delivered_orders",
+            "freight_cost_per_delivered_case_inr",
+        ]
+        with self._connect() as connection:
+            if not self._exists(connection, "ext_freight_invoice_current"):
+                frame = pd.DataFrame(columns=columns)
+                frame.attrs["unavailable_reason"] = "Run `make sync-freight` first."
+                return frame
+            freight_where, freight_parameters = self._shared_freight_filters(
+                filters,
+                date_column="invoice.service_date",
+                warehouse_alias="warehouse",
+                route_column="invoice.route_code",
+            )
+            delivery_where, delivery_parameters = self._shared_freight_filters(
+                filters,
+                date_column="service.delivery_date",
+                warehouse_alias="warehouse",
+                route_column="service.route_code",
+            )
+            frame = connection.execute(
+                f"""
+                WITH freight AS (
+                    SELECT invoice.route_code,
+                           count(*) AS invoice_count,
+                           sum(invoice.billed_freight_cost_inr) AS freight_cost_inr,
+                           sum(invoice.detention_charge_inr) AS detention_cost_inr,
+                           sum(invoice.billed_freight_cost_inr)
+                               FILTER (WHERE invoice.invoice_status = 'PAID') AS paid_cost_inr,
+                           sum(invoice.billed_freight_cost_inr)
+                               FILTER (WHERE invoice.invoice_status = 'PENDING')
+                               AS pending_cost_inr,
+                           sum(invoice.billed_freight_cost_inr)
+                               FILTER (WHERE invoice.invoice_status = 'DISPUTED')
+                               AS disputed_cost_inr
+                    FROM ext_freight_invoice_current invoice
+                    JOIN dim_warehouse warehouse
+                      ON warehouse.warehouse_code = invoice.warehouse_code
+                    WHERE {freight_where}
+                    GROUP BY invoice.route_code
+                ), delivered AS (
+                    SELECT service.route_code,
+                           sum(service.delivered_case_equivalents)
+                               AS delivered_case_equivalents,
+                           count(*) AS delivered_orders
+                    FROM fct_order_service service
+                    JOIN dim_warehouse warehouse
+                      ON warehouse.warehouse_code = service.warehouse_code
+                    WHERE service.is_eligible_service AND {delivery_where}
+                    GROUP BY service.route_code
+                )
+                SELECT coalesce(freight.route_code, delivered.route_code) AS route_code,
+                       route.route_name,
+                       freight.invoice_count,
+                       freight.freight_cost_inr,
+                       freight.detention_cost_inr,
+                       freight.paid_cost_inr,
+                       freight.pending_cost_inr,
+                       freight.disputed_cost_inr,
+                       delivered.delivered_case_equivalents,
+                       delivered.delivered_orders,
+                       freight.freight_cost_inr
+                           / nullif(delivered.delivered_case_equivalents, 0)
+                           AS freight_cost_per_delivered_case_inr
+                FROM freight
+                FULL OUTER JOIN delivered USING (route_code)
+                LEFT JOIN dim_route route
+                  ON route.route_code = coalesce(freight.route_code, delivered.route_code)
+                ORDER BY freight_cost_per_delivered_case_inr DESC NULLS LAST, route_code
+                """,
+                [*freight_parameters, *delivery_parameters],
+            ).fetchdf()
+        frame.attrs["ignored_filters"] = self._ignored_freight_filters(filters)
+        frame.attrs["attribution"] = (
+            "Invoice numerator and delivered-case denominator are independently aggregated at "
+            "service period × route; no invoice-to-delivery linkage is claimed."
+        )
+        return frame
+
     @staticmethod
     def _order_filter_sql(filters: FilterSet) -> tuple[str, list[Any]]:
         conditions = ["requested_delivery_date BETWEEN ? AND ?"]
@@ -387,4 +487,120 @@ class ExternalAnalyticsService:
                 GROUP BY listing.city, match.status
                 ORDER BY listing.city, match.status
                 """
+            ).fetchdf()
+
+    @staticmethod
+    def _validate_read_limit(limit: int) -> None:
+        if limit <= 0 or limit > 1_000:
+            raise ValueError("limit must be between 1 and 1000")
+
+    def competitor_review_queue(
+        self,
+        *,
+        city: str | None = None,
+        limit: int = 100,
+    ) -> pd.DataFrame:
+        """Return unresolved current listings without promoting them into price metrics."""
+
+        self._validate_read_limit(limit)
+        columns = [
+            "listing_id",
+            "city",
+            "retailer",
+            "raw_title",
+            "observed_brand",
+            "observed_category",
+            "observed_pack_value",
+            "observed_pack_uom",
+            "current_price_inr",
+            "last_seen",
+            "collected_at_utc",
+            "match_status",
+            "match_confidence",
+            "runner_up_confidence",
+            "suggested_product_id",
+            "suggested_sku_code",
+            "algorithm_reason",
+            "sync_id",
+            "observation_id",
+        ]
+        with self._connect() as connection:
+            if not self._exists(connection, "vw_competitor_match_review_queue"):
+                frame = pd.DataFrame(columns=columns)
+                frame.attrs["unavailable_reason"] = "Run `make scrape-prices` first."
+                return frame
+            city_sql = ""
+            parameters: list[Any] = []
+            if city:
+                city_sql = "WHERE city = ?"
+                parameters.append(city)
+            parameters.append(limit)
+            frame = connection.execute(
+                f"""
+                SELECT {", ".join(columns)}
+                FROM vw_competitor_match_review_queue
+                {city_sql}
+                ORDER BY match_status, match_confidence DESC, listing_id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchdf()
+        frame.attrs["governance"] = (
+            "Only ambiguous, low-confidence or no-candidate current listings appear here; "
+            "none contribute to competitor price metrics."
+        )
+        return frame
+
+    def competitor_observation_history(
+        self,
+        listing_id: str,
+        *,
+        limit: int = 100,
+    ) -> pd.DataFrame:
+        """Return provenance-rich observation and match history for one listing ID."""
+
+        self._validate_read_limit(limit)
+        if not listing_id.strip():
+            raise ValueError("listing_id cannot be empty")
+        columns = [
+            "listing_id",
+            "city",
+            "retailer",
+            "raw_title",
+            "current_price_inr",
+            "is_available",
+            "last_seen",
+            "collected_at_utc",
+            "sync_id",
+            "observation_id",
+            "match_status",
+            "match_confidence",
+            "runner_up_confidence",
+            "product_id",
+            "sku_code",
+            "suggested_product_id",
+            "suggested_sku_code",
+            "match_provenance",
+            "algorithm_status",
+            "algorithm_reason",
+            "match_reason",
+            "decision_source",
+            "reviewer",
+            "reviewed_on",
+            "review_note",
+        ]
+        with self._connect() as connection:
+            if not self._exists(connection, "vw_competitor_price_history"):
+                frame = pd.DataFrame(columns=columns)
+                frame.attrs["unavailable_reason"] = "No competitor history is available."
+                return frame
+            return connection.execute(
+                f"""
+                SELECT {", ".join(columns)}
+                FROM vw_competitor_price_history
+                WHERE listing_id = ?
+                ORDER BY collected_at_utc DESC, observation_id DESC
+                LIMIT ?
+                """,
+                [listing_id.strip(), limit],
             ).fetchdf()

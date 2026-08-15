@@ -14,6 +14,8 @@ def _clear_path_overrides(monkeypatch: MonkeyPatch) -> None:
         "KESTREL_RUNTIME_DIR",
         "KESTREL_FREIGHT_CACHE",
         "KESTREL_COMPETITOR_CACHE",
+        "KESTREL_WEATHER_CACHE",
+        "KESTREL_HOLIDAY_CACHE",
         "KESTREL_BAZAARPULSE_SITE_ROOT",
     ):
         monkeypatch.delenv(name, raising=False)

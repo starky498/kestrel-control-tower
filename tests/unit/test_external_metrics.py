@@ -21,6 +21,12 @@ def _external_database(path: Path) -> None:
             );
             INSERT INTO dim_warehouse VALUES ('WH01', 'Mumbai DC', 'West');
 
+            CREATE TABLE dim_route (
+                route_code VARCHAR,
+                route_name VARCHAR
+            );
+            INSERT INTO dim_route VALUES ('RT0001', 'Mumbai Route 1');
+
             CREATE TABLE fct_order_service (
                 warehouse_code VARCHAR,
                 route_code VARCHAR,
@@ -122,6 +128,21 @@ def test_freight_reports_filters_that_cannot_be_attributed(tmp_path: Path) -> No
     )
 
     assert frame.attrs["ignored_filters"] == ("customer region", "outlet")
+
+
+def test_freight_cost_per_case_supports_independent_route_grain(tmp_path: Path) -> None:
+    database = tmp_path / "external.duckdb"
+    _external_database(database)
+
+    frame = ExternalAnalyticsService(database).freight_by_route(_filters())
+
+    assert len(frame) == 1
+    assert frame.iloc[0]["route_code"] == "RT0001"
+    assert frame.iloc[0]["route_name"] == "Mumbai Route 1"
+    assert frame.iloc[0]["freight_cost_inr"] == Decimal("1100.00")
+    assert frame.iloc[0]["delivered_case_equivalents"] == 100
+    assert frame.iloc[0]["freight_cost_per_delivered_case_inr"] == 11
+    assert "service period × route" in frame.attrs["attribution"]
 
 
 def test_competitor_gap_keeps_unmatched_top_skus_visible(tmp_path: Path) -> None:

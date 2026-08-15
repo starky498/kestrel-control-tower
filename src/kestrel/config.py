@@ -53,9 +53,14 @@ class Settings:
     runtime_dir: Path
     freight_cache: Path
     competitor_cache: Path
+    weather_cache: Path
+    holiday_cache: Path
     freight_api_url: str
     freight_api_key: str | None
     bazaarpulse_base_url: str
+    weather_api_url: str
+    holiday_api_url: str
+    holiday_fallback_url: str
     bazaarpulse_site_root: Path | None
     near_expiry_days: int
     competitor_match_threshold: int
@@ -86,6 +91,12 @@ class Settings:
             competitor_cache=_path_from_env(
                 "KESTREL_COMPETITOR_CACHE", runtime_dir / "bazaarpulse_listings.json"
             ),
+            weather_cache=_path_from_env(
+                "KESTREL_WEATHER_CACHE", runtime_dir / "weather_daily.json"
+            ),
+            holiday_cache=_path_from_env(
+                "KESTREL_HOLIDAY_CACHE", runtime_dir / "india_holidays.json"
+            ),
             freight_api_url=os.getenv(
                 "KESTREL_FREIGHT_API_URL", "http://127.0.0.1:8088"
             ).rstrip("/"),
@@ -93,6 +104,19 @@ class Settings:
             bazaarpulse_base_url=os.getenv(
                 "KESTREL_BAZAARPULSE_BASE_URL", "http://127.0.0.1:8080"
             ).rstrip("/"),
+            weather_api_url=os.getenv(
+                "KESTREL_WEATHER_API_URL",
+                "https://archive-api.open-meteo.com/v1/archive",
+            ).rstrip("/"),
+            holiday_api_url=os.getenv(
+                "KESTREL_HOLIDAY_API_URL",
+                "https://date.nager.at/api/v3/PublicHolidays",
+            ).rstrip("/"),
+            holiday_fallback_url=os.getenv(
+                "KESTREL_HOLIDAY_FALLBACK_URL",
+                "https://calendar.google.com/calendar/ical/"
+                "en.indian%23holiday%40group.v.calendar.google.com/public/basic.ics",
+            ),
             bazaarpulse_site_root=site_root,
             near_expiry_days=int(os.getenv("KESTREL_NEAR_EXPIRY_DAYS", "30")),
             competitor_match_threshold=int(
@@ -120,3 +144,5 @@ class Settings:
         self.analytics_db.parent.mkdir(parents=True, exist_ok=True)
         self.freight_cache.parent.mkdir(parents=True, exist_ok=True)
         self.competitor_cache.parent.mkdir(parents=True, exist_ok=True)
+        self.weather_cache.parent.mkdir(parents=True, exist_ok=True)
+        self.holiday_cache.parent.mkdir(parents=True, exist_ok=True)

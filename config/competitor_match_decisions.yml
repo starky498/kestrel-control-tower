@@ -1,0 +1,19 @@
+schema_version: 1
+
+# Human-reviewed entity-resolution decisions. Keep one decision per BazaarPulse listing ID.
+# A match is accepted only when the target SKU exists, clears the reviewed-score guardrail,
+# and has no known brand or pack conflict. Weak records remain in the review queue.
+#
+# decisions:
+#   - listing_id: "12345"
+#     action: match
+#     sku_code: "SKU000123"
+#     reviewer: "Analyst Name"
+#     reviewed_on: 2026-08-15
+#     note: "Pack, brand and product variant verified against the listing detail."
+#   - listing_id: "67890"
+#     action: reject
+#     reviewer: "Analyst Name"
+#     reviewed_on: 2026-08-15
+#     note: "Marketplace bundle has no equivalent Kestrel sellable SKU."
+decisions: []

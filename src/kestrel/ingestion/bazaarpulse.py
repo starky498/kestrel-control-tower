@@ -180,7 +180,20 @@ class ProductCandidate:
     pack_size_uom: str | None = None
 
 
-MatchStatus = Literal["matched", "ambiguous", "low_confidence", "no_candidates"]
+MatchStatus = Literal[
+    "matched",
+    "ambiguous",
+    "low_confidence",
+    "no_candidates",
+    "rejected",
+]
+MatchProvenance = Literal[
+    "automatic",
+    "automatic_high_confidence",
+    "automatic_quarantine",
+    "manual_match",
+    "manual_rejection",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +207,15 @@ class ProductMatch:
     product_id: int | str | None
     sku_code: str | None
     reason: str
+    suggested_product_id: int | str | None = None
+    suggested_sku_code: str | None = None
+    provenance: MatchProvenance = "automatic"
+    algorithm_status: MatchStatus | None = None
+    algorithm_reason: str | None = None
+    decision_source: str | None = None
+    reviewer: str | None = None
+    reviewed_on: date | None = None
+    review_note: str | None = None
 
     @property
     def matched(self) -> bool:
@@ -702,6 +724,26 @@ def _pack_matches(listing: Listing, product: ProductCandidate) -> bool | None:
     return listing_pack[1] == product_pack[1] and abs(listing_pack[0] - product_pack[0]) < 1e-6
 
 
+def product_identity_conflicts(
+    listing: Listing, product: ProductCandidate
+) -> tuple[str, ...]:
+    """Return hard identity conflicts that a manual decision may not override.
+
+    Product titles can be noisy, but a known brand or normalized pack disagreement is strong
+    evidence that two records represent different products.  Keeping this guard separate from
+    the fuzzy score ensures a reviewed mapping cannot silently force a weak entity link.
+    """
+
+    conflicts: list[str] = []
+    listing_brand = normalize_brand(listing.brand)
+    product_brand = normalize_brand(product.brand)
+    if listing_brand and product_brand and listing_brand != product_brand:
+        conflicts.append(f"brand differs ({listing_brand} vs {product_brand})")
+    if _pack_matches(listing, product) is False:
+        conflicts.append("normalized pack size or unit differs")
+    return tuple(conflicts)
+
+
 def score_product_candidate(listing: Listing, product: ProductCandidate) -> float:
     """Score title, brand, pack, and category agreement on a zero-to-one scale."""
 
@@ -759,6 +801,8 @@ def match_listing_to_products(
             product_id=None,
             sku_code=None,
             reason="No product candidates were supplied.",
+            provenance="automatic_quarantine",
+            algorithm_status="no_candidates",
         )
 
     ranked = sorted(
@@ -780,6 +824,10 @@ def match_listing_to_products(
                 f"Best candidate {best.sku_code} scored {confidence:.3f}, below the "
                 f"{minimum_confidence:.3f} acceptance threshold."
             ),
+            suggested_product_id=best.product_id,
+            suggested_sku_code=best.sku_code,
+            provenance="automatic_quarantine",
+            algorithm_status="low_confidence",
         )
     if runner_up is not None and confidence - runner_up < ambiguity_margin:
         return ProductMatch(
@@ -793,6 +841,10 @@ def match_listing_to_products(
                 f"Top candidates are separated by {confidence - runner_up:.3f}, below the "
                 f"{ambiguity_margin:.3f} ambiguity margin."
             ),
+            suggested_product_id=best.product_id,
+            suggested_sku_code=best.sku_code,
+            provenance="automatic_quarantine",
+            algorithm_status="ambiguous",
         )
     return ProductMatch(
         listing_id=listing.listing_id,
@@ -802,6 +854,10 @@ def match_listing_to_products(
         product_id=best.product_id,
         sku_code=best.sku_code,
         reason="Best candidate cleared both confidence and ambiguity thresholds.",
+        suggested_product_id=best.product_id,
+        suggested_sku_code=best.sku_code,
+        provenance="automatic_high_confidence",
+        algorithm_status="matched",
     )
 
 

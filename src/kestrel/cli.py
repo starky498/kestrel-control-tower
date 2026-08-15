@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, date, datetime
+from functools import wraps
+from inspect import signature
 from pathlib import Path
+from typing import ParamSpec, TypeVar
 
 import typer
 
@@ -16,22 +21,71 @@ from kestrel.ingestion.bazaarpulse import (
     HttpSiteSource,
     match_listings_to_products,
 )
+from kestrel.ingestion.context import (
+    ContextClient,
+    load_holiday_cache,
+    load_weather_cache,
+)
 from kestrel.ingestion.freight import FreightClient, load_last_good_cache
 from kestrel.integration_store import (
     load_product_candidates,
     store_bazaarpulse_snapshot,
     store_freight_snapshot,
+    store_holiday_snapshot,
+    store_weather_snapshot,
 )
+from kestrel.market_governance import (
+    MatchGovernanceError,
+    apply_match_decisions,
+    load_match_decisions,
+)
+from kestrel.observability import observe_run
 from kestrel.warehouse import build_warehouse
 
 app = typer.Typer(no_args_is_help=True, help="Kestrel control-tower operations.")
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 def _settings() -> Settings:
     return Settings.load()
 
 
+def _observed_cli(operation: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Wrap a CLI operation in a redacted local run trace without changing its signature."""
+
+    def decorate(command: Callable[P, R]) -> Callable[P, R]:
+        @wraps(command)
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            settings = _settings()
+            bound = signature(command).bind_partial(*args, **kwargs)
+            with observe_run(
+                settings.runtime_dir,
+                operation,
+                details={"arguments": dict(bound.arguments)},
+            ):
+                return command(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
+
+
+def _validated_cleanup_target(path: Path, runtime: Path) -> Path:
+    """Resolve one generated target and reject escapes or symlink indirection."""
+
+    if path.is_symlink():
+        raise ConfigurationError(f"Refusing to clean symlinked generated path: {path}")
+    resolved = path.resolve()
+    if resolved == runtime or not resolved.is_relative_to(runtime):
+        raise ConfigurationError(
+            f"Refusing to clean path outside the project runtime directory: {resolved}"
+        )
+    return resolved
+
+
 @app.command()
+@_observed_cli("doctor")
 def doctor() -> None:
     """Check paths and report whether the project is ready to build and run."""
 
@@ -44,6 +98,8 @@ def doctor() -> None:
         "analytics_db_exists": settings.analytics_db.is_file(),
         "freight_api_url": settings.freight_api_url,
         "freight_api_key_configured": bool(settings.freight_api_key),
+        "weather_cache_exists": settings.weather_cache.is_file(),
+        "holiday_cache_exists": settings.holiday_cache.is_file(),
         "bazaarpulse_site_root": (
             str(settings.bazaarpulse_site_root) if settings.bazaarpulse_site_root else None
         ),
@@ -54,6 +110,7 @@ def doctor() -> None:
 
 
 @app.command("validate-data")
+@_observed_cli("validate_data")
 def validate_data(json_output: bool = typer.Option(False, "--json")) -> None:
     """Run schema, grain, relationship, parity, and known-conflict checks."""
 
@@ -76,6 +133,7 @@ def validate_data(json_output: bool = typer.Option(False, "--json")) -> None:
 
 
 @app.command()
+@_observed_cli("build_warehouse")
 def build() -> None:
     """Build and atomically promote the local DuckDB analytical model."""
 
@@ -85,6 +143,7 @@ def build() -> None:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     typer.echo(f"Built {summary.analytics_db}")
+    typer.echo(f"Exported compressed Parquet snapshot to {summary.parquet_dir}")
     typer.echo(f"Raw rows: {summary.raw_rows:,}")
     for table, count in summary.model_rows.items():
         typer.echo(f"{table}: {count:,}")
@@ -92,6 +151,7 @@ def build() -> None:
 
 
 @app.command("scrape-prices")
+@_observed_cli("scrape_prices")
 def scrape_prices(
     use_http: bool = typer.Option(
         False,
@@ -138,11 +198,27 @@ def scrape_prices(
 
     products = load_product_candidates(analytics_db)
     threshold = settings.competitor_match_threshold / 100
-    matches = match_listings_to_products(
+    automatic_matches = match_listings_to_products(
         listings,
         products,
         minimum_confidence=threshold,
     )
+    decision_path = settings.project_root / "config" / "competitor_match_decisions.yml"
+    try:
+        decisions = load_match_decisions(decision_path)
+        matches = apply_match_decisions(
+            listings,
+            automatic_matches,
+            products,
+            decisions,
+            decision_source="config/competitor_match_decisions.yml",
+        )
+    except MatchGovernanceError as error:
+        typer.echo(
+            f"Competitor match governance failed; no snapshot was published: {error}",
+            err=True,
+        )
+        raise typer.Exit(code=1) from error
     summary = store_bazaarpulse_snapshot(
         analytics_db,
         listings,
@@ -162,16 +238,17 @@ def scrape_prices(
 
 
 @app.command("sync-freight")
+@_observed_cli("sync_freight")
 def sync_freight(
     date_from: str = typer.Option(
-        "2026-04-01",
+        "2025-01-01",
         "--from",
-        help="Inclusive invoice date (YYYY-MM-DD); defaults to FY 2026-27 Q1.",
+        help="Inclusive invoice date (YYYY-MM-DD); default is the full supplied history.",
     ),
     date_to: str = typer.Option(
         "2026-06-30",
         "--to",
-        help="Inclusive invoice date (YYYY-MM-DD); defaults to FY 2026-27 Q1.",
+        help="Inclusive invoice date (YYYY-MM-DD); default is the full supplied history.",
     ),
     resume: bool = typer.Option(
         True,
@@ -261,30 +338,145 @@ def sync_freight(
     )
 
 
+@app.command("sync-context")
+@_observed_cli("sync_context")
+def sync_context(
+    date_from: str = typer.Option(
+        "2025-01-01",
+        "--from",
+        help="Inclusive context date (YYYY-MM-DD).",
+    ),
+    date_to: str = typer.Option(
+        "2026-06-30",
+        "--to",
+        help="Inclusive context date (YYYY-MM-DD).",
+    ),
+    offline_cache: bool = typer.Option(
+        False,
+        "--offline-cache",
+        help="Publish any validated context caches without network requests.",
+    ),
+) -> None:
+    """Refresh optional weather and holiday context with source-level isolation."""
+
+    settings = _settings()
+    try:
+        analytics_db = settings.require_analytics_db()
+        parsed_from = date.fromisoformat(date_from)
+        parsed_to = date.fromisoformat(date_to)
+        if parsed_from > parsed_to:
+            raise ValueError("--from cannot be after --to")
+    except (ConfigurationError, ValueError) as error:
+        typer.echo(f"Invalid context sync configuration: {error}", err=True)
+        raise typer.Exit(code=2) from error
+
+    settings.ensure_runtime_dirs()
+    failures: list[str] = []
+    if offline_cache:
+        for label, loader, path, publisher in (
+            ("weather", load_weather_cache, settings.weather_cache, store_weather_snapshot),
+            ("holidays", load_holiday_cache, settings.holiday_cache, store_holiday_snapshot),
+        ):
+            try:
+                summary = publisher(analytics_db, loader(path))
+                typer.echo(
+                    f"Published {summary.record_count:,} cached {label} rows; "
+                    f"coverage={summary.coverage_start} to {summary.coverage_end}."
+                )
+            except Exception as error:
+                failures.append(f"{label}: {error}")
+                typer.echo(f"Skipped {label} cache: {error}", err=True)
+    else:
+        with ContextClient(
+            weather_cache_path=settings.weather_cache,
+            holiday_cache_path=settings.holiday_cache,
+            weather_url=settings.weather_api_url,
+            holiday_url=settings.holiday_api_url,
+            holiday_fallback_url=settings.holiday_fallback_url,
+        ) as client:
+            outcomes = client.sync_all(date_from=parsed_from, date_to=parsed_to)
+        for outcome in outcomes:
+            label = (
+                "weather" if outcome.source_name == "open_meteo_weather" else "holidays"
+            )
+            if not outcome.complete:
+                failures.append(f"{label}: {outcome.error}")
+                typer.echo(
+                    f"{label.title()} refresh failed; its last-good cache and analytical "
+                    f"snapshot were preserved: {outcome.error}",
+                    err=True,
+                )
+                continue
+            try:
+                if outcome.source_name == "open_meteo_weather":
+                    cache = load_weather_cache(outcome.cache_path)
+                    summary = store_weather_snapshot(analytics_db, cache)
+                else:
+                    cache = load_holiday_cache(outcome.cache_path)
+                    summary = store_holiday_snapshot(analytics_db, cache)
+            except Exception as error:
+                failures.append(f"{label}: {error}")
+                typer.echo(
+                    f"{label.title()} publication failed; its prior analytical snapshot "
+                    f"was preserved: {error}",
+                    err=True,
+                )
+                continue
+            typer.echo(
+                f"Published {summary.record_count:,} {label} rows; "
+                f"coverage={summary.coverage_start} to {summary.coverage_end}; "
+                f"cache={outcome.cache_path}"
+            )
+    if failures:
+        raise typer.Exit(code=1)
+
+
 @app.command("clean-generated")
+@_observed_cli("clean_generated")
 def clean_generated(confirm: bool = typer.Option(False, "--yes")) -> None:
     """Remove only generated runtime files under the configured `.kestrel` directory."""
 
     settings = _settings()
-    runtime = settings.runtime_dir.resolve()
-    project_runtime = (settings.project_root / ".kestrel").resolve()
-    if runtime != project_runtime:
+    configured_runtime = settings.runtime_dir
+    expected_runtime = settings.project_root / ".kestrel"
+    runtime = configured_runtime.resolve()
+    project_runtime = expected_runtime.resolve()
+    if (
+        configured_runtime.is_symlink()
+        or expected_runtime.is_symlink()
+        or runtime != project_runtime
+    ):
         typer.echo(
-            "Refusing to clean a custom runtime directory. "
-            "Remove it manually after verifying the path.",
+            "Refusing to clean a custom or symlinked runtime directory. Remove it manually "
+            "after verifying the path.",
             err=True,
         )
         raise typer.Exit(code=2)
     if not confirm:
         typer.echo("Re-run with --yes to remove generated files under .kestrel only.")
         raise typer.Exit(code=2)
-    for path in (
-        settings.analytics_db,
-        settings.freight_cache,
-        settings.competitor_cache,
-    ):
-        Path(path).unlink(missing_ok=True)
-    typer.echo("Removed generated analytical and integration cache files.")
+    try:
+        targets = tuple(
+            _validated_cleanup_target(Path(path), runtime)
+            for path in (
+                settings.analytics_db,
+                settings.freight_cache,
+                settings.competitor_cache,
+                settings.weather_cache,
+                settings.holiday_cache,
+                runtime / "parquet",
+                runtime / "logs",
+            )
+        )
+    except ConfigurationError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=2) from error
+    for target in targets:
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink(missing_ok=True)
+    typer.echo("Removed generated analytical, cache, Parquet, and log files under .kestrel.")
 
 
 if __name__ == "__main__":
