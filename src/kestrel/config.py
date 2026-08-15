@@ -38,9 +38,46 @@ def _discover_project_root() -> Path:
     return Path.cwd().resolve()
 
 
+def project_config_path(filename: str) -> Path:
+    """Resolve a repository configuration file in source and installed runtimes.
+
+    Docker and non-editable installations load Python modules from ``site-packages`` rather
+    than ``src``. Resolving through the configured/discovered project root keeps the tracked
+    configuration under ``<project>/config`` available in both layouts.
+    """
+
+    relative = Path(filename)
+    if relative.is_absolute() or len(relative.parts) != 1 or relative.name != filename:
+        raise ValueError("Configuration filename must be one plain relative filename")
+    return _discover_project_root() / "config" / relative
+
+
 def _path_from_env(name: str, default: Path) -> Path:
     raw = os.getenv(name)
     return Path(raw).expanduser().resolve() if raw else default.resolve()
+
+
+def _bool_from_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be true or false")
+
+
+def _bounded_float_from_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    try:
+        value = default if raw is None else float(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a number") from exc
+    if not 0 <= value <= 1:
+        raise ConfigurationError(f"{name} must be between 0 and 1")
+    return value
 
 
 @dataclass(frozen=True)
@@ -64,6 +101,10 @@ class Settings:
     bazaarpulse_site_root: Path | None
     near_expiry_days: int
     competitor_match_threshold: int
+    nlq_semantic_enabled: bool
+    nlq_model_path: Path
+    nlq_min_confidence: float
+    nlq_min_margin: float
 
     @classmethod
     def load(cls) -> Settings:
@@ -122,6 +163,15 @@ class Settings:
             competitor_match_threshold=int(
                 os.getenv("KESTREL_COMPETITOR_MATCH_THRESHOLD", "86")
             ),
+            nlq_semantic_enabled=_bool_from_env("KESTREL_NLQ_SEMANTIC_ENABLED", True),
+            nlq_model_path=_path_from_env(
+                "KESTREL_NLQ_MODEL_PATH",
+                runtime_dir / "models" / "all-MiniLM-L6-v2",
+            ),
+            nlq_min_confidence=_bounded_float_from_env(
+                "KESTREL_NLQ_MIN_CONFIDENCE", 0.50
+            ),
+            nlq_min_margin=_bounded_float_from_env("KESTREL_NLQ_MIN_MARGIN", 0.08),
         )
 
     def require_source_db(self) -> Path:
@@ -146,3 +196,4 @@ class Settings:
         self.competitor_cache.parent.mkdir(parents=True, exist_ok=True)
         self.weather_cache.parent.mkdir(parents=True, exist_ok=True)
         self.holiday_cache.parent.mkdir(parents=True, exist_ok=True)
+        self.nlq_model_path.parent.mkdir(parents=True, exist_ok=True)
