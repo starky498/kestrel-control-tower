@@ -8,11 +8,34 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_MARKERS = (Path("pyproject.toml"), Path("config") / "metrics.yml")
 
 
 class ConfigurationError(RuntimeError):
     """Raised when a required runtime setting is missing or invalid."""
+
+
+def _is_project_root(path: Path) -> bool:
+    return all((path / marker).is_file() for marker in PROJECT_MARKERS)
+
+
+def _discover_project_root() -> Path:
+    """Resolve the checkout root for source and non-editable wheel installations."""
+
+    configured = os.getenv("KESTREL_PROJECT_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+
+    origins = (Path.cwd().resolve(), Path(__file__).resolve().parent)
+    visited: set[Path] = set()
+    for origin in origins:
+        for candidate in (origin, *origin.parents):
+            if candidate in visited:
+                continue
+            visited.add(candidate)
+            if _is_project_root(candidate):
+                return candidate
+    return Path.cwd().resolve()
 
 
 def _path_from_env(name: str, default: Path) -> Path:
@@ -39,18 +62,19 @@ class Settings:
 
     @classmethod
     def load(cls) -> Settings:
-        load_dotenv(PROJECT_ROOT / ".env", override=False)
-        runtime_dir = _path_from_env("KESTREL_RUNTIME_DIR", PROJECT_ROOT / ".kestrel")
-        bundled_db = PROJECT_ROOT / "data" / "source" / "data" / "kestrel_ops.db"
+        project_root = _discover_project_root()
+        load_dotenv(project_root / ".env", override=False)
+        runtime_dir = _path_from_env("KESTREL_RUNTIME_DIR", project_root / ".kestrel")
+        bundled_db = project_root / "data" / "source" / "data" / "kestrel_ops.db"
         site_root_raw = os.getenv("KESTREL_BAZAARPULSE_SITE_ROOT")
-        bundled_site = PROJECT_ROOT / "data" / "source" / "bazaarpulse_site"
+        bundled_site = project_root / "data" / "source" / "bazaarpulse_site"
         site_root = (
             Path(site_root_raw).expanduser().resolve()
             if site_root_raw
             else bundled_site.resolve() if bundled_site.exists() else None
         )
         return cls(
-            project_root=PROJECT_ROOT,
+            project_root=project_root,
             source_db=_path_from_env("KESTREL_SOURCE_DB", bundled_db),
             analytics_db=_path_from_env(
                 "KESTREL_ANALYTICS_DB", runtime_dir / "kestrel.duckdb"
