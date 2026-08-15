@@ -1,0 +1,107 @@
+fill_rate:
+  title: Fill rate
+  formula: sum(delivered quantity) / sum(ordered quantity)
+  grain: Order line, aggregated as a ratio of sums
+  date_basis: Requested delivery date
+  eligible_population: DELIVERED and PARTIAL orders for currently active, non-deleted, non-test outlets
+  numerator: Delivered eaches or delivered case-equivalents, capped only at the presentation ratio
+  denominator: Ordered eaches or ordered case-equivalents
+  unit: percent
+  status: verified
+  warning: Eaches and case-equivalents are both available; eaches is the default.
+
+strict_otif:
+  title: Strict OTIF
+  formula: count(orders on time and strict in full) / count(eligible completed orders)
+  grain: Order
+  date_basis: Requested delivery date
+  eligible_population: DELIVERED and PARTIAL orders for currently active, non-deleted, non-test outlets
+  numerator: Eligible orders whose parsed actual arrival is on/before planned arrival and every line is full
+  denominator: Eligible completed orders
+  unit: percent
+  status: data_conflict
+  warning: Every supplied order line is short-delivered, so strict in-full and strict OTIF are 0%.
+
+on_time_rate:
+  title: Timestamp-derived on-time rate
+  formula: count(actual arrival <= planned arrival) / count(eligible deliveries)
+  grain: Delivery
+  date_basis: Planned arrival date
+  eligible_population: Deliveries for eligible completed orders with parseable planned and actual timestamps
+  numerator: On-time eligible deliveries
+  denominator: Eligible deliveries with parseable timestamps
+  unit: percent
+  status: proxy
+  warning: Stored delay_minutes conflicts with parsed timestamps on 67,211 supplied deliveries and is shown separately.
+
+late_over_2h_rate:
+  title: More-than-two-hours-late rate
+  formula: count(timestamp-derived delay > 120 minutes) / count(eligible deliveries)
+  grain: Delivery
+  date_basis: Planned arrival date
+  eligible_population: Eligible deliveries with parseable planned and actual timestamps
+  numerator: Eligible deliveries more than 120 minutes late
+  denominator: Eligible deliveries with parseable timestamps
+  unit: percent
+  status: proxy
+  warning: This uses parsed timestamps; the stored delay field is retained as a conflicting source signal.
+
+temperature_excursions_per_100:
+  title: Temperature excursions per 100 chilled deliveries
+  formula: 100 * distinct chilled deliveries flagged with an excursion / distinct chilled deliveries
+  grain: Delivery
+  date_basis: Planned arrival date
+  eligible_population: Eligible deliveries containing at least one chilled SKU
+  numerator: Distinct chilled deliveries with temperature_excursion_flag = 1
+  denominator: Distinct eligible chilled deliveries
+  unit: per_100
+  status: proxy
+  warning: The source flag is used because max_temp_celsius does not reliably explain the flag.
+
+near_expiry_cases:
+  title: Near-expiry available cases
+  formula: sum(available_cases where expiry date is within the configured future window)
+  grain: Warehouse × SKU × batch × weekly snapshot
+  date_basis: Latest inventory snapshot on or before the selected period end
+  eligible_population: Positive available stock with 0 to 30 days remaining by default
+  numerator: Available cases
+  denominator: Not applicable
+  unit: cases
+  status: verified
+  warning: Inventory is weekly and current case packs are used upstream for on_hand_eaches.
+
+approved_credit_note_rate:
+  title: Approved credit-note leakage rate
+  formula: approved credit-note value / estimated delivered line value
+  grain: Period-level ratio across separate return and order-line facts
+  date_basis: Return date for credit notes; requested delivery date for delivered value
+  eligible_population: Approved credit notes and eligible completed-order dispatch estimates
+  numerator: Approved credit_note_value_inr
+  denominator: Delivered quantity × booked unit price × (1 - booked line discount)
+  unit: percent
+  status: estimated
+  warning: This is measured gross commercial leakage, not accounting profit or cash collected.
+
+freight_cost_per_case:
+  title: Paid freight per delivered case-equivalent
+  formula: paid billed freight in rupees / delivered case-equivalents
+  grain: Independently aggregated period × warehouse or period × route
+  date_basis: Freight service date and requested delivery date
+  eligible_population: Paid freight invoices and eligible completed-order delivered case-equivalents
+  numerator: API invoice amount_paise / 100 for PAID invoices
+  denominator: Delivered case-equivalents
+  unit: INR_per_case
+  status: estimated
+  warning: Freight has no order/delivery key; numerator and denominator are never joined invoice-to-delivery.
+
+competitor_price_gap:
+  title: Observed market price gap
+  formula: Kestrel current MRP - lowest latest observed in-stock competitor price
+  grain: Matched Kestrel SKU × city
+  date_basis: Latest observed listing date
+  eligible_population: High-confidence, non-ambiguous, in-stock competitor matches
+  numerator: Kestrel current MRP minus observed competitor price
+  denominator: Not applicable
+  unit: INR
+  status: partial_coverage
+  warning: BazaarPulse is refreshed weekly; results are latest observed, not live prices.
