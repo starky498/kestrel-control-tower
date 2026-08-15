@@ -1,0 +1,20 @@
+services:
+  control-tower:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      KESTREL_PROJECT_ROOT: /app
+      KESTREL_SOURCE_DB: /app/data/source/data/kestrel_ops.db
+      KESTREL_ANALYTICS_DB: /app/.kestrel/kestrel.duckdb
+      KESTREL_RUNTIME_DIR: /app/.kestrel
+      KESTREL_BAZAARPULSE_SITE_ROOT: /app/data/source/bazaarpulse_site
+      KESTREL_FREIGHT_API_URL: ${KESTREL_FREIGHT_API_URL:-http://host.docker.internal:8088}
+      KESTREL_FREIGHT_API_KEY: ${KESTREL_FREIGHT_API_KEY:-}
+    volumes:
+      - ./data/source:/app/data/source:ro
+      - kestrel-runtime:/app/.kestrel
+    restart: unless-stopped
+
+volumes:
+  kestrel-runtime:

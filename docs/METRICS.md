@@ -1,114 +1,330 @@
 # Governed Metric Contracts
 
-Every published result has a formula, grain, date basis, eligibility rule, numerator/denominator,
-and evidence path. Dashboard cards and Ask Kestrel share these contracts from
-`config/metrics.yml` and the metric services.
+## Contract and registry
 
-## Service
+Every published metric has a stable key, semantic version, title, formula, grain, date basis,
+eligible population, numerator, denominator, unit, status, and warning in
+`config/metrics.yml`. The dashboard and Ask Kestrel load that registry and call the same
+parameterized metric services. Presentation code does not redefine a formula.
 
-### Fill rate
+The current registry contains 24 definitions, all at version `1.0.0`:
+
+| Family | Metric key | Formula summary | Grain and canonical date |
+|---|---|---|---|
+| Promise | `allocation_rate` | allocated quantity / ordered quantity | Order line ratio of sums; requested delivery date |
+| Promise | `post_allocation_fulfilment` | delivered quantity / allocated quantity | Order line ratio of sums; requested delivery date |
+| Promise | `fill_rate` | line-capped delivered quantity / ordered quantity | Order line ratio of sums; requested delivery date |
+| Promise | `fill_rate_eaches` | line-capped delivered eaches / ordered eaches | Order line ratio of sums; requested delivery date |
+| Promise | `fill_rate_case_equivalents` | line-capped delivered case-equivalents / ordered case-equivalents | Order line ratio of sums; requested delivery date |
+| Exposure | `short_delivery_value_exposure_inr` | booked value associated proportionally with undelivered quantity | Eligible completed order line; requested delivery date |
+| Promise | `strict_otif` | strict in-full **and** on-time orders / eligible completed orders | Order; requested delivery date |
+| Promise | `on_time_rate` | timestamp-on-time orders / eligible completed orders | Delivery rolled to order service; requested delivery date |
+| Promise | `late_over_2h_rate` | timestamp delay over 120 minutes / eligible completed orders | Delivery rolled to order service; requested delivery date |
+| Backlog | `overdue_backlog_orders` | count of eligible OPEN orders due by reporting as-of date | Current order state; selected period end |
+| Delivery | `delivery_on_time_rate` | timestamp-on-time deliveries / eligible deliveries | Delivery; actual delivery date |
+| Delivery | `delivery_late_over_2h_rate` | timestamp delay over 120 minutes / eligible deliveries | Delivery; actual delivery date |
+| Delivery | `pod_coverage_rate` | deliveries with POD captured / eligible deliveries | Delivery; actual delivery date |
+| Delivery | `delay_source_conflict_rate` | deliveries with delay reconciliation conflict / eligible deliveries | Delivery; actual delivery date |
+| Delivery | `recorded_failure_rate` | deliveries with a failure-reason label / eligible deliveries | Delivery; actual delivery date |
+| Cold chain | `temperature_excursions_per_100` | 100 × flagged chilled deliveries / chilled deliveries | Distinct delivery; actual delivery date |
+| Inventory | `near_expiry_cases` | available cases with 0–30 expiry days | DC × SKU × batch; latest eligible snapshot |
+| Lifecycle | `orders_after_discontinuation` | order lines placed after the product discontinuation date | Order line; order date |
+| Leakage | `approved_credit_note_value_inr` | sum of APPROVED credit-note value | Credit-note line; return date |
+| Leakage | `approved_credit_note_rate` | approved credit value / estimated delivered dispatch value | Separately aggregated facts; return/requested dates |
+| Freight | `freight_cost_per_case` | billed freight / delivered case-equivalents | Separately aggregated period × DC/route; service/actual dates |
+| Freight | `settled_freight_cost_per_case` | PAID freight / delivered case-equivalents | Separately aggregated period × DC/route; service/actual dates |
+| Market | `competitor_price_gap` | current Kestrel MRP − lowest governed observed competitor price | SKU × city; latest listing observation |
+| Market | `competitor_match_coverage` | governed current matches / all current listings | Current listing snapshot; latest governed collection |
+
+## Common eligibility and quantity rules
+
+Operational service metrics use `DELIVERED` and `PARTIAL` orders for outlets that are currently
+active, not deleted, and not test outlets. OPEN orders are excluded from completed-service ratios
+and enter only the governed backlog metric. Empty or zero denominators produce “not available,”
+never a fabricated zero.
+
+Each order line is normalized with its order-time pack:
 
 ```text
-eaches fill = sum(delivered_eaches) / sum(ordered_eaches)
-case-equivalent fill = sum(delivered_case_equivalents) / sum(ordered_case_equivalents)
+if qty_uom = CASE:
+    eaches = quantity × case_pack_at_order
+    case_equivalents = quantity
+else:
+    eaches = quantity
+    case_equivalents = quantity / case_pack_at_order
 ```
 
-Quantities are normalized per line with `case_pack_at_order`; subgroup percentages are never
-averaged. The cohort uses requested delivery date. Eligible service includes `DELIVERED` and
-`PARTIAL` orders for currently active, non-deleted, non-test outlets. Eaches is the default because
-it is the later, commercially specific stakeholder request; case-equivalents remain selectable.
+Eaches is the default because it is the later, commercially specific stakeholder request.
+Case-equivalents remain selectable, and the Executive workspace publishes both explicit
+`fill_rate_eaches` and `fill_rate_case_equivalents` cards side by side. The basis-sensitive
+`fill_rate` remains the reusable selector-backed contract. Every grouped percentage is a ratio of
+summed numerators and denominators; line or subgroup percentages are never averaged.
+
+## Promise, allocation, and service
+
+```text
+allocation rate             = sum(allocated) / sum(ordered)
+post-allocation fulfilment  = sum(delivered) / sum(allocated)
+fill rate                   = sum(min(delivered, ordered) per line) / sum(ordered)
+```
+
+Delivery is capped separately on every order line for fill only. This prevents an oversupplied
+line from offsetting another line's shortage. Allocation and post-allocation fulfilment retain
+their recorded quantities and their separate formulas.
+
+The Service workspace also shows ordered → allocated → delivered quantities from the same
+requested-delivery line cohort, followed by exactly linked physical return quantities observed
+through the selected period end. Return quantity is not another fulfilment gate and is not cash or
+recovery. Recorded `order_source` and `promo_code` (enriched from the promotion catalogue) can
+segment supporting evidence, but association with a promotion is not redemption or causal lift.
+
+The three gates identify where recorded loss occurs in the chain without asserting its cause.
+Allocation shortfall is `max(ordered − allocated, 0)`; post-allocation shortfall is
+`max(allocated − delivered, 0)`. Rankings carry volume and use an explicit minimum-volume guard
+where the UI compares best, worst, or most-improved groups. Ties are deterministic.
 
 ### Strict OTIF
 
 ```text
 line_in_full  = delivered_eaches >= ordered_eaches
-order_in_full = every line_in_full
+order_in_full = every eligible line_in_full
 on_time       = parsed actual_arrival <= parsed planned_arrival
 strict_OTIF   = order_in_full AND on_time
 ```
 
-The grain is order; the cohort is requested delivery date. All supplied lines are short, so strict
-in-full and strict OTIF are 0%. Fill and on-time remain separate diagnostics. Stored
-`delay_minutes` is preserved because it changes 25,734 classifications, but parsed event
-timestamps are the chosen primary. No undocumented tolerance is calculated.
+OTIF is evaluated at order grain, not line grain. Every one of the 511,516 supplied order lines is
+short-delivered, so the supplied data produces 0% strict in-full and strict OTIF. This is a data
+finding under the documented strict definition, not an assertion that a tolerance-based business
+SLA would also be zero. No undocumented 95%, 98%, or 99% tolerance is substituted.
 
-### Late over two hours
+Parsed timestamps are the primary on-time source. The raw stored delay is retained because it
+differs from parsed timestamp delay on 67,211 deliveries and changes on-time classification on
+25,734. These are reconciliation signals, not records to silently repair.
 
-An eligible delivery is late over two hours when parsed `actual_arrival - planned_arrival > 120`
-minutes. Route rates are late deliveries divided by eligible deliveries, with counts shown beside
-rates.
+### Backlog
+
+`overdue_backlog_orders` counts currently OPEN orders for eligible outlets whose requested
+delivery date is on or before the selected period end. Source order status is current state, so a
+historical period selection is an as-of reporting cut over current status, not a reconstruction of
+what status was on that past date.
+
+## Delivery and exception evidence
+
+The Delivery & Exception Drivers workspace deliberately uses actual delivery date. Its five
+versioned rates are:
+
+```text
+delivery on time       = actual_arrival <= planned_arrival
+more than 2h late      = actual_arrival - planned_arrival > 120 minutes
+POD coverage           = pod_captured deliveries / eligible deliveries
+delay conflict         = reconciled-conflict deliveries / eligible deliveries
+recorded failure       = deliveries with non-empty failure_reason_code / eligible deliveries
+```
+
+A delay conflict means the stored delay differs from the timestamp-derived delay by more than one
+minute or the timestamps cannot support reconciliation. The workspace reports rates with counts,
+trends, minimum-volume-qualified route/vendor comparisons, a Pareto of recorded failure labels,
+and row evidence. A telematics vendor or failure label is an associated source attribute; it does
+not establish responsibility, root cause, or blame.
+
+The promise-cohort `on_time_rate` and `late_over_2h_rate` answer service-commitment questions by
+requested delivery date. The delivery-cohort equivalents answer operational exception questions
+by actual delivery date. They must not be presented as interchangeable.
+
+Ask Kestrel's late-route question uses the actual-delivery cohort, the strict `>120 minutes` and
+`>10%` thresholds, and a minimum of 25 actual-date deliveries per route. The floor is included in
+the answer warning so a tiny route cannot enter the ranking silently.
 
 ## Cold chain and inventory
 
 ```text
-excursions per 100 = 100 × flagged chilled deliveries / chilled deliveries
+temperature excursions per 100 =
+    100 × distinct chilled deliveries flagged with an excursion
+        / distinct eligible chilled deliveries
 ```
 
-A delivery is chilled when any line contains a product with `is_chilled = true`; a delivery counts
-once. Operational month uses actual delivery date. Excursion flags on non-chilled deliveries are a
-quality exception, not part of the KPI.
+A delivery is chilled when any associated order line contains a product with `is_chilled = true`.
+Each delivery counts once. The source excursion flag is governed because recorded maximum
+temperature does not reliably explain it. An excursion flag on a non-chilled delivery is a data
+quality exception and is excluded from this KPI.
 
-Near-expiry stock is `available_cases` with `expiry_days` from 0 through the configured 30-day
-window, using the latest weekly snapshot on or before the selected period end. The snapshot date is
-part of the result.
+Near-expiry inventory sums positive `available_cases` with expiry days from zero through the
+configured window, 30 days by default, at the latest weekly snapshot on or before the selected
+period end. The snapshot date and threshold travel with the result. Inventory is not interpolated
+and is never compared with the computer's current date. Inventory can apply DC-region and DC
+filters; it has no historical customer/order key, so customer region, route, outlet, and channel
+are ignored for this component and disclosed when active on Executive or Cold Chain pages.
+
+Cold-chain-associated returns use the documented source reason labels and exact original order-line
+link. The evidence retains workflow status, raw signed quantity, sign-normalization flag, eaches,
+case-equivalents, and disposition. The language remains “associated with,” not “caused by.”
 
 ## Measured leakage
 
 ```text
-estimated dispatch value = line_value × min(delivered_qty / ordered_qty, 1)
-approved credit leakage rate = approved credit-note value / estimated dispatch value
+estimated line dispatch value =
+    booked line_value_inr × min(delivered_qty / ordered_qty, 1)
+
+approved credit-note leakage rate =
+    sum(APPROVED credit_note_value_inr) / sum(estimated line dispatch value)
+
+short-delivery booked-value exposure =
+    sum(line_value_inr × max(ordered_qty − delivered_qty, 0) / ordered_qty)
 ```
 
-Returns use absolute normalized quantity and the originating line's order-time case pack. Approved
-credit notes form the headline; pending and rejected remain separate. This is a gross measured
-leakage estimate, not profit or cash collected.
+The numerator is grouped by return date; the dispatch denominator is grouped by requested delivery
+date over the same selected range. Approved notes form the headline. Pending and rejected values
+remain visible separately. Return quantities are normalized with the originating line's order-time
+pack and sign rules.
+
+The dispatch fraction is capped per line, so oversupply cannot inflate the denominator. Ask
+Kestrel ranks only APPROVED value by the requested category/reason dimension and appends a separate
+APPROVED/PENDING/REJECTED workflow-status evidence block.
+
+The short-delivery calculation is a proportional booked-value exposure on eligible completed order
+lines with positive ordered quantity. It is ranked by recorded dimensions including product,
+customer/warehouse geography, order source, and promotion where supported. It is not an invoice,
+credit, cash loss, or causal attribution.
+
+Return disposition views retain the source labels `RESTOCK`, `SCRAP`, and `VENDOR_RECOVERY` with
+their recorded quantities and credit-note values. A disposition label is physical/workflow evidence;
+it does not prove resale, destruction, vendor settlement, or recovered cash.
+
+These are measured commercial leakage/exposure estimates. They are not profit, margin, cash
+received, or loss after cost. COGS, collections, labour, rent, tax, bad debt, and overhead are not
+supplied.
 
 ## Freight
 
 ```text
-billed freight = amount_paise / 100 + detention_charge_paise / 100
-freight per delivered case = sum(billed freight) / sum(delivered case-equivalents)
+billed freight INR = amount_paise / 100 + detention_charge_paise / 100
+
+settled freight per delivered case-equivalent =
+    sum(billed freight INR where invoice_status = PAID)
+        / sum(delivered case-equivalents)
+
+billed freight per delivered case-equivalent =
+    sum(billed freight INR) / sum(delivered case-equivalents)
 ```
 
-The numerator and denominator are independently aggregated over freight service date / actual
-delivery date and warehouse. The API supplies no order or delivery key, and most invoice
-warehouse-route pairs conflict with the route master; no row-level lineage is invented. Paid,
-pending, and disputed spend are shown separately. Carrier spend is valid, but carrier-attributed
-delivered cases are not.
+The API provides no order or delivery key. Invoice numerator and delivered-case denominator are
+therefore aggregated independently over the same freight service/actual delivery period and DC (or
+route where defensible), then divided. There is no invoice-to-delivery row join. Customer region,
+outlet, and channel filters cannot apply symmetrically and are ignored with disclosure rather than
+being applied to one side.
 
-## Price position
+The primary card is `settled_freight_cost_per_case`: PAID invoice amount plus detention divided by
+delivered case-equivalents. The all-status `freight_cost_per_case` remains an explicitly billed
+secondary view, with pending and disputed components stated separately. Carrier invoice spend is
+valid. Carrier-attributed delivered cases or carrier cost per case are not available because
+operational deliveries contain no carrier key. Driver-entered fuel cost is not used as carrier
+freight. Route tables can rank the lowest current billed ratio, worst ratio, and most improved
+ratio only after the stated invoice/delivery volume gates; this remains an aggregate comparison,
+not row-level attribution.
+
+The optional full refresh requests invoice dates 2025-01-01 through 2026-06-30. Verified evidence
+contains 41,500 invoices over 208 pages, 237 requests, and 29 retries. Observed service dates begin
+2024-12-29 because service can precede invoice date.
+
+## Market position
 
 ```text
-price gap = current Kestrel MRP - lowest available matched competitor price
-MRP premium % = Kestrel MRP / competitor price - 1
+price gap INR = current Kestrel MRP − lowest latest observed in-stock competitor price
+MRP premium % = current Kestrel MRP / competitor price − 1
 ```
 
-The set is the top SKUs by eligible estimated dispatch value in the selected period. Competitor
-prices are the latest collected listing-card observations for the chosen city. Only high-confidence,
-non-ambiguous matches affect the comparison; unmatched top SKUs stay visible as missing coverage.
-The result is not described as live or historical reconstruction.
+Top Kestrel SKUs are ranked by eligible estimated dispatch value for the selected period. The
+current competitor side uses the lowest latest in-stock governed listing for the chosen city and
+retains its retailer, listing ID, raw shelf price, pack, normalized unit, stock state, and observed
+date. Exact normalized packs can be compared directly; comparable mass and volume packs also expose
+100G/100ML unit prices. Non-comparable packs remain explicit nulls. Only a final matched, available
+listing can affect the price comparison. Unmatched and ambiguous top SKUs stay visible as coverage
+gaps.
 
-## Period and filter rules
+Automatic matching combines normalized name, brand, pack, and category evidence and requires both
+confidence and separation from the runner-up. Source-controlled reviewed match/reject decisions
+retain reviewer, date, note, decision source, automatic outcome, and final outcome. A reviewed
+match cannot bypass candidate score 0.80 or brand/pack conflicts. Current position, append-only
+scrape audit history, and source-dated detail-page history are different evidence products. The
+verified snapshot has 1,137 current listings, 1,088 governed matches, and 49 review-queue rows.
+Detail pages supply 6,804 immutable observations for 1,134 listings over 6 May–30 June 2026; missing
+detail pages for IDs `387`, `458`, and `777` are retained as structured warnings.
 
-| Fact | Canonical date |
+Historical comparisons resolve `product_price_history` on the source observation date, never by
+substituting today's MRP, and retain both raw pack price and 100G/100ML normalized evidence where
+units are comparable. The Market workspace also combines selected-period service/short-delivery
+exposure with governed source-price position as an attention list; it is descriptive prioritization,
+not evidence that competitor price caused service performance. No weekly observation is described
+as live.
+
+## Optional context associations
+
+Weather and public holidays are contextual evidence, not registry KPIs and not inputs to service
+scores. When published, each cohort reports observed late rate, chilled temperature-excursion rate,
+and weighted eaches fill rate.
+
+A context result is withheld unless all applicable gates pass:
+
+1. A typed snapshot and successful, complete sync record both exist.
+2. The entire selected period lies inside observed source coverage.
+3. Cache age is no more than 365 days.
+4. Weather has every expected warehouse-day and all configured warehouses.
+5. At least 95% of eligible operational rows join by `delivery_date × warehouse_code` for weather.
+6. Each comparison cohort contains at least 30 eligible orders.
+
+Weather compares `rainy_day` (`precipitation_sum_mm >= 1`) with `little_or_no_rain` at the
+warehouse-city centroid. Holidays compare national public-holiday with non-holiday requested dates.
+Every result says: **descriptive association only; no causal effect is estimated**. Weather is not
+route or outlet observation, and the national calendar is not a state-specific closure schedule.
+
+## Date and filter semantics
+
+| Fact or decision | Canonical date |
 |---|---|
-| Fill, OTIF, shortage cohort | Requested delivery date |
-| Delivery lateness and cold chain | Actual delivery date |
-| Return leakage | Return date |
+| Allocation, post-allocation, fill, strict OTIF, promise on-time, shortage | Requested delivery date |
+| Overdue OPEN backlog | Requested delivery date, measured against selected period end |
+| Delivery exceptions and cold chain | Actual delivery date |
+| Credit-note numerator | Return date |
 | Dispatch-value denominator | Requested delivery date |
-| Inventory | Latest snapshot on/before period end |
+| Inventory | Latest snapshot on or before selected period end |
 | Freight numerator | Carrier service date |
-| Competitor observation | Listing `last_seen` |
+| Freight delivered-case denominator | Actual delivery date |
+| Competitor position | Latest listing `last_seen` observation |
+| Competitor source history | Detail-page source observation date; Kestrel MRP effective on that date |
+| Weather association | Actual delivery date × warehouse code |
+| Holiday association | Requested delivery date |
 
-Customer region, origin/DC region, warehouse, route, outlet, and channel are distinct allowlisted
-filters. A filter that cannot apply symmetrically to freight numerator and denominator is ignored
-there and reported rather than biasing one side.
+Customer region, origin/DC region, DC, route, outlet, channel, category, recorded order source, and
+recorded promotion are distinct allowlisted dimensions where the underlying fact has those keys. A
+page or query applies only filters that are defensible for all components and discloses any ignored
+filter. Ask Kestrel does not guess whether an unqualified “region” means customer or origin/DC
+geography.
 
-## Evidence rules
+`orders.created_at` is normalized by source system: ERP `DD/MM/YYYY HH:MM`, SFA
+`YYYY-MM-DD HH:MM:SS`, and partner ISO `...Z`, with explicit UTC-to-IST conversion for the latter.
+The raw value, `created_at_ist`, and parse status remain together in semantic evidence. No published
+KPI uses order creation time; service and delivery cohorts continue to use their canonical dates.
 
-1. A missing/zero denominator is “not available,” never silently zero.
-2. Every rate exposes numerator, denominator, and record count.
-3. Current-state master attributes are never presented as historical unless an effective-dated
-   source exists.
-4. “Why” answers describe measured contribution or association, not causality.
-5. External metrics expose coverage/freshness and complete-cache state.
+## Evidence and ranking rules
+
+1. Every rate exposes numerator, denominator, and relevant record count.
+2. A missing or zero denominator is unavailable, not zero.
+3. Rankings show volume and apply a minimum-volume threshold when small groups could dominate.
+4. Period, date basis, quantity basis, applied filters, ignored filters, definition, version, and
+   relevant freshness/coverage accompany the result.
+5. Current-state master attributes are not described as effective-dated history.
+6. Raw conflict fields and the chosen normalized interpretation coexist.
+7. “Why,” “driver,” and “performer” outputs mean measured contribution or association unless a
+   causal design exists. This system contains no causal design.
+
+## Semantic version policy
+
+Increase a metric version when a change alters formula, native grain, eligible population,
+numerator, denominator, date basis, unit conversion, filter behavior, threshold, or source-of-truth
+choice. A backwards-incompatible change requires a major version; a compatible addition to the
+evidence contract requires a minor version; a wording correction that cannot change a number may
+use a patch version. Presentation-only color, layout, or chart changes do not change the metric
+version.
+
+Changing the YAML label alone must never be used to conceal changed computation. Registry changes,
+service code, tests, and release notes should move together.

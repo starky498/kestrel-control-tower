@@ -2,47 +2,48 @@
 
 ## What I built
 
-A working seven-page Streamlit control tower backed by an atomic, reproducible DuckDB build. It
-validates all 13 supplied tables and CSV parity, preserves native fact grains, defaults the landing
-page to FY 2026–27 Q1, and exposes governed service, cold-chain, inventory, credit-note, freight,
-and price-position evidence. Freight ingestion handles cursor pagination, paise conversion,
-429/503/timeouts, resume checkpoints, and complete last-good caches. BazaarPulse collection follows
-only allowed listing pages and accepts product matches only above confidence and ambiguity gates.
-Ask Kestrel maps supported language to typed metric intents and fixed service methods; it never
-executes generated SQL. CI runs lint, type checks, and deterministic tests.
+An eight-workspace Streamlit control tower over a reproducible SQLite → DuckDB semantic build and
+fingerprinted Parquet exports. It validates all 13 supplied tables and CSV parity, preserves native
+fact grains, defaults to FY 2026–27 Q1, and serves 24 versioned `1.0.0` metric contracts to the UI
+and governed question services.
+
+The full-history freight client is retryable, resumable, and last-good protected. BazaarPulse uses
+allowed listing/detail pages, conservative automatic matching, reviewed YAML decisions,
+current/append-only scrape evidence, immutable source-dated price history, a review queue, and a
+read-only API. Optional weather and national holidays have isolated
+caches and publication gates. Redacted JSONL operations, version-pinned package locks, CI, non-root
+Docker/Compose, recovery documentation, and a repeatable eight-workspace audit complete the
+delivery path.
 
 ## Judgments and assumptions
 
-- Eaches is the default because Sales gave the later, commercially specific requirement;
-  case-equivalents using `case_pack_at_order` remain selectable.
-- Completed service is `DELIVERED` or `PARTIAL`. Current closed/deleted and clearly named test
-  outlets are excluded; this current-status limitation is visible.
-- Fill and OTIF use requested delivery date. Delivery operations use actual arrival date, returns
-  use return date, freight uses service date, and inventory is snapshot-relative.
-- In-full is strict at every line. Because every supplied line is short, strict OTIF is 0%; I did
-  not invent a 95/98/99% tolerance.
-- Parsed planned/actual timestamps define on-time. Stored `delay_minutes` is retained as a
-  conflicting source because 25,734 rows change classification.
-- Near expiry means positive available stock expiring within 30 days of the latest snapshot on or
-  before the period end. Approved credit notes form the main leakage numerator; return signs are
-  normalized to absolute quantities.
-- Billed freight is API `amount + detention_charge`, converted from paise. The API has no delivery
-  key, so cost and delivered cases are aggregated independently by service period × warehouse (or
-  route). Carrier-level delivered cases are not claimed.
-- Competitor results use current Kestrel MRP and latest observed available listings, not live or
-  historical prices. “Why” means measured contribution/association, not causation or blame.
+- Eaches is the default because Sales gave the later commercial requirement; order-time
+  case-equivalents remain selectable.
+- Completed service is `DELIVERED` or `PARTIAL` for currently active, non-deleted, non-test outlets.
+- Fill/OTIF use requested date; delivery/cold chain use actual date; returns use return date;
+  freight uses service date; inventory is snapshot-relative.
+- In-full is strict on every line. All supplied lines are short, so strict OTIF is 0%; no tolerance
+  is invented. Parsed timestamps define on-time, while conflicting stored delay remains evidence.
+- Allocation, post-allocation fulfilment, backlog, failure labels, context, and “why” outputs are
+  measured states or associations—not causation, responsibility, or blame.
+- PAID invoice amount plus detention is the primary settled-freight view. All-status billed,
+  pending, and disputed values remain explicit. Without a delivery key, invoice cost and delivered
+  cases aggregate independently by shared period and DC or route; carrier case volume is not
+  claimed.
+- Approved credit notes are measured leakage, not profit. COGS, collections, labour, rent, tax,
+  debt, and overhead are absent.
+- Competitor observations are latest/source-dated, not live. Historical comparisons use the
+  Kestrel MRP effective on the observation date and comparable packs normalize to 100G/100ML.
+  Review cannot bypass minimum score, brand, or pack safety.
 
-## Deliberately not built
+## Boundaries and next production steps
 
-No graph database, universal flattened fact, unrestricted chatbot/text-to-SQL, authentication/RBAC,
-alerting workflow, or accounting-profit calculation. Weather and holiday enrichment were deferred:
-the core brief is answerable without adding an external correlation that could be mistaken for a
-cause.
+No graph database, universal flattened fact, unrestricted text-to-SQL, accounting-profit model,
+RBAC, or automated alert/approval workflow was added. City-centroid weather and a national holiday
+calendar cannot establish route/outlet conditions or closure.
 
-## Two more weeks / first production limits
-
-I would add scheduled incremental orchestration, SCD customer/product assignments, reviewed match
-overrides, regional access control, anomaly alerts, observability/SLOs, and deployment. At 100×
-volume the full local rebuild and synchronous Streamlit query path fail first; move partitioned raw
-data to object storage and marts to a managed warehouse while keeping the same grains, semantic
-service, metric contracts, and reconciliation tests.
+With two more weeks I would add incremental orchestration, effective-dated customer/product
+assignments, role-scoped access, alert acknowledgement, secrets management, SLOs, and managed
+deployment. At 100× volume, full single-node rebuilds and synchronous Streamlit queries fail first;
+move partitioned raw data to object storage and marts to a managed warehouse while retaining the
+same grains, metric versions, typed services, gates, and reconciliation tests.
