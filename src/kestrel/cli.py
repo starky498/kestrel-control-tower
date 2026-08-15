@@ -100,6 +100,11 @@ def doctor() -> None:
         "freight_api_key_configured": bool(settings.freight_api_key),
         "weather_cache_exists": settings.weather_cache.is_file(),
         "holiday_cache_exists": settings.holiday_cache.is_file(),
+        "nlq_semantic_enabled": settings.nlq_semantic_enabled,
+        "nlq_model_path": str(settings.nlq_model_path),
+        "nlq_model_marker_exists": (
+            settings.nlq_model_path / "kestrel-model.json"
+        ).is_file(),
         "bazaarpulse_site_root": (
             str(settings.bazaarpulse_site_root) if settings.bazaarpulse_site_root else None
         ),

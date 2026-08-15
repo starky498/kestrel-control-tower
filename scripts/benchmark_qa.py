@@ -12,6 +12,7 @@ from pathlib import Path
 from kestrel.metrics.external import ExternalAnalyticsService
 from kestrel.metrics.service import AnalyticsService
 from kestrel.nlq import AnswerStatus, DimensionKey, MetricKey, QuestionRouter
+from kestrel.nlq.semantic import SemanticBackendUnavailable, build_local_semantic_resolver
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +84,91 @@ CASES = (
         DimensionKey.OUTLET,
         100,
     ),
+    BenchmarkCase(
+        "allocation_by_warehouse",
+        "Which five warehouses had the lowest allocation rate last month?",
+        AnswerStatus.OK,
+        MetricKey.ALLOCATION_RATE,
+        DimensionKey.WAREHOUSE,
+        5,
+    ),
+    BenchmarkCase(
+        "post_allocation_by_warehouse",
+        "Which five warehouses had the lowest post-allocation fulfilment last month?",
+        AnswerStatus.OK,
+        MetricKey.POST_ALLOCATION_FULFILMENT,
+        DimensionKey.WAREHOUSE,
+        5,
+    ),
+    BenchmarkCase(
+        "requested_cohort_on_time",
+        "Which five routes had the lowest on-time rate last quarter?",
+        AnswerStatus.OK,
+        MetricKey.ON_TIME_RATE,
+        DimensionKey.ROUTE,
+        5,
+    ),
+    BenchmarkCase(
+        "actual_delivery_cohort_on_time",
+        "Which five routes had the lowest actual-delivery-date on-time rate last quarter?",
+        AnswerStatus.OK,
+        MetricKey.DELIVERY_ON_TIME_RATE,
+        DimensionKey.ROUTE,
+        5,
+    ),
+    BenchmarkCase(
+        "overdue_backlog_by_warehouse",
+        "Which five warehouses have the largest overdue backlog last quarter?",
+        AnswerStatus.OK,
+        MetricKey.BACKLOG,
+        DimensionKey.WAREHOUSE,
+        5,
+    ),
+    BenchmarkCase(
+        "short_delivery_exposure",
+        "Which five warehouses have the largest short-delivery value exposure last quarter?",
+        AnswerStatus.OK,
+        MetricKey.SHORT_DELIVERY_EXPOSURE,
+        DimensionKey.WAREHOUSE,
+        5,
+    ),
+    BenchmarkCase(
+        "near_expiry_inventory",
+        "Which five warehouses have the worst inventory risk last quarter?",
+        AnswerStatus.OK,
+        MetricKey.INVENTORY_RISK,
+        DimensionKey.WAREHOUSE,
+        5,
+    ),
+    BenchmarkCase(
+        "competitor_match_coverage",
+        "What is competitor match coverage in Mumbai?",
+        AnswerStatus.OK,
+        MetricKey.COMPETITOR_COVERAGE,
+    ),
+    BenchmarkCase(
+        "spelling_correction",
+        "Which five warehoses had the worst fil rte last month?",
+        AnswerStatus.OK,
+        MetricKey.FILL_RATE,
+        DimensionKey.WAREHOUSE,
+        5,
+    ),
+)
+
+SEMANTIC_CASES = (
+    BenchmarkCase(
+        "local_semantic_post_allocation_paraphrase",
+        "Which depots keep falling short after stock has already been assigned?",
+        AnswerStatus.OK,
+        MetricKey.POST_ALLOCATION_FULFILMENT,
+    ),
+    BenchmarkCase(
+        "local_semantic_inventory_paraphrase",
+        "Where is stock close to going out of date?",
+        AnswerStatus.OK,
+        MetricKey.INVENTORY_RISK,
+    ),
 )
 
 
@@ -103,13 +189,28 @@ def _case_failures(case: BenchmarkCase, answer: object) -> list[str]:
     return failures
 
 
-def run_benchmark(database: Path, *, threshold_ms: float) -> dict[str, object]:
+def run_benchmark(
+    database: Path,
+    *,
+    threshold_ms: float,
+    model_path: Path | None = None,
+) -> dict[str, object]:
+    semantic_resolver = None
+    if model_path is not None and (model_path / "kestrel-model.json").is_file():
+        try:
+            semantic_resolver = build_local_semantic_resolver(model_path)
+        except (OSError, ValueError, SemanticBackendUnavailable):
+            # A marker alone is not evidence of a valid installation. Keep the benchmark in its
+            # rules-only mode unless every manifest size/checksum check succeeds.
+            semantic_resolver = None
     router = QuestionRouter(
         AnalyticsService(database),
         ExternalAnalyticsService(database),
+        semantic_resolver=semantic_resolver,
     )
     results: list[dict[str, object]] = []
-    for case in CASES:
+    cases = (*CASES, *SEMANTIC_CASES) if semantic_resolver is not None else CASES
+    for case in cases:
         started = time.perf_counter()
         answer = router.answer(case.question)
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -132,6 +233,7 @@ def run_benchmark(database: Path, *, threshold_ms: float) -> dict[str, object]:
         "database": str(database),
         "case_count": len(results),
         "threshold_ms": threshold_ms,
+        "local_semantic_model_enabled": semantic_resolver is not None,
         "passed": all(bool(result["passed"]) for result in results),
         "cases": results,
     }
@@ -142,8 +244,17 @@ def main() -> int:
     parser.add_argument("--database", type=Path, default=Path(".kestrel/kestrel.duckdb"))
     parser.add_argument("--output", type=Path, default=Path(".kestrel/qa-benchmark.json"))
     parser.add_argument("--threshold-ms", type=float, default=5_000.0)
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=Path(".kestrel/models/all-MiniLM-L6-v2"),
+    )
     arguments = parser.parse_args()
-    report = run_benchmark(arguments.database.resolve(), threshold_ms=arguments.threshold_ms)
+    report = run_benchmark(
+        arguments.database.resolve(),
+        threshold_ms=arguments.threshold_ms,
+        model_path=arguments.model_path.resolve(),
+    )
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))

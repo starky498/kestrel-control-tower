@@ -61,6 +61,8 @@ def ask_kestrel(
     filters: FilterSet,
     basis: QuantityBasis,
     definitions: dict[str, MetricDefinition],
+    settings: Settings | None = None,
+    conversation_memory: Any = None,
 ) -> CapabilityResult:
     """Call the optional governed NLQ router through a narrow, explicit contract."""
 
@@ -82,6 +84,8 @@ def ask_kestrel(
                 filters=filters,
                 basis=basis,
                 definitions=definitions,
+                settings=settings,
+                conversation_memory=conversation_memory,
             )
         else:
             router_class = getattr(module, "QuestionRouter", None)
@@ -94,3 +98,44 @@ def ask_kestrel(
     except Exception as error:  # Keep optional capability failures isolated.
         return CapabilityResult(False, f"Ask Kestrel could not answer this question: {error}")
     return CapabilityResult(True, "Governed answer returned.", payload)
+
+
+def create_nlq_memory() -> CapabilityResult:
+    """Create one optional conversation-memory object for a UI session."""
+
+    try:
+        module = importlib.import_module("kestrel.nlq")
+        memory_class = module.ConversationMemory
+        memory = memory_class()
+    except (AttributeError, ImportError, TypeError) as error:
+        return CapabilityResult(False, f"Follow-up memory is unavailable: {error}")
+    return CapabilityResult(True, "Session follow-up memory ready.", memory)
+
+
+def nlq_model_status(settings: Settings) -> CapabilityResult:
+    """Inspect the optional local model without importing its inference runtime."""
+
+    if not settings.nlq_semantic_enabled:
+        return CapabilityResult(False, "Local semantic matching is disabled in configuration.")
+    try:
+        module = importlib.import_module("kestrel.nlq.model_install")
+        metadata = module.installed_model_metadata(settings.nlq_model_path)
+    except (AttributeError, ImportError, OSError, TypeError, ValueError) as error:
+        return CapabilityResult(False, f"Local model status is unavailable: {error}")
+    if metadata is None:
+        return CapabilityResult(
+            False,
+            "The optional local language model is not installed; exact rules remain active.",
+        )
+    return CapabilityResult(True, "Verified local language model ready.", metadata)
+
+
+def install_nlq_model(settings: Settings) -> CapabilityResult:
+    """Download the checksum-pinned public model into the configured local path."""
+
+    try:
+        module = importlib.import_module("kestrel.nlq.model_install")
+        metadata = module.install_model(target=settings.nlq_model_path)
+    except Exception as error:  # Network and filesystem failures must not break the app.
+        return CapabilityResult(False, f"Local model installation failed: {error}")
+    return CapabilityResult(True, "Verified local language model installed.", metadata)

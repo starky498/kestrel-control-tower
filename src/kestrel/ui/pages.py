@@ -47,7 +47,10 @@ from kestrel.ui.filters import FilterContext, with_dates
 from kestrel.ui.optional import (
     ask_kestrel,
     call_external,
+    create_nlq_memory,
     external_analytics,
+    install_nlq_model,
+    nlq_model_status,
 )
 
 Definitions = dict[str, MetricDefinition]
@@ -3779,6 +3782,8 @@ def _render_nlq_payload(payload: Any) -> None:
         if not warnings and metadata.get("warning"):
             warnings = (metadata["warning"],)
         suggestions = payload.get("suggestions", ())
+        resolver_provenance = metadata.get("resolver_provenance")
+        matched_example = metadata.get("matched_example")
         evidence = payload.get("evidence")
         if evidence is None:
             evidence = payload.get("data")
@@ -3789,6 +3794,8 @@ def _render_nlq_payload(payload: Any) -> None:
         sources = getattr(payload, "sources", ())
         warnings = getattr(payload, "warnings", ())
         suggestions = getattr(payload, "suggestions", ())
+        resolver_provenance = None
+        matched_example = None
         evidence = getattr(payload, "evidence", None)
 
     if not summary:
@@ -3807,6 +3814,10 @@ def _render_nlq_payload(payload: Any) -> None:
         if sources:
             source_text = sources if isinstance(sources, str) else " · ".join(map(str, sources))
             st.markdown("**Sources**  \n" + source_text)
+        if resolver_provenance:
+            st.markdown(f"**Resolver provenance**  \n{resolver_provenance}")
+        if matched_example:
+            st.markdown(f"**Nearest approved example**  \n{matched_example}")
     if suggestions:
         suggestion_text = (
             suggestions if isinstance(suggestions, str) else " · ".join(map(str, suggestions))
@@ -3840,7 +3851,6 @@ def render_ask(
     definitions: Definitions,
     settings: Settings,
 ) -> None:
-    del settings
     page_header(
         "Ask Kestrel",
         "Questions are resolved through a governed intent router and the same metric service as "
@@ -3849,15 +3859,55 @@ def render_ask(
         chips=context.dimension_chips,
         eyebrow="GOVERNED QUESTION INTERFACE",
     )
+    memory_key = "kp_nlq_conversation_memory"
+    if memory_key not in st.session_state:
+        memory_result = create_nlq_memory()
+        if memory_result.available:
+            st.session_state[memory_key] = memory_result.payload
+    conversation_memory = st.session_state.get(memory_key)
+
+    model_status = nlq_model_status(settings)
+    controls = st.columns([4, 1])
+    with controls[0]:
+        if model_status.available:
+            st.caption(
+                "Local paraphrase understanding is ready. Metric calculation remains "
+                "governed and deterministic."
+            )
+        elif settings.nlq_semantic_enabled:
+            st.caption(
+                "Exact rules are active. Install the optional keyless local model to "
+                "understand more paraphrases (~23 MB on common CPUs)."
+            )
+            if st.button("Install local language model", key="kp_install_nlq_model"):
+                with st.spinner("Downloading and verifying the pinned local model…"):
+                    install_result = install_nlq_model(settings)
+                if install_result.available:
+                    st.success(install_result.message)
+                    st.rerun()
+                else:
+                    st.error(install_result.message)
+        else:
+            st.caption("Local semantic matching is disabled; exact governed rules are active.")
+    with controls[1]:
+        if conversation_memory is not None and st.button(
+            "New conversation", key="kp_clear_nlq_memory"
+        ):
+            conversation_memory.clear()
+            st.success("Follow-up context cleared.")
     examples = (
         "Why did fill rate drop in the West customer region?",
         "Which five outlets had the lowest case fill rate?",
         "What was OTIF by customer region?",
-        "What was fill rate in the West DC region?",
-        "Which categories drove approved credit notes?",
-        "Which routes were more than two hours late most often?",
+        "Which warehouses have the largest overdue backlog?",
+        "Where is allocation weakest by customer region?",
+        "Which routes are missing proof of delivery?",
     )
     st.caption("Example questions: " + "  ·  ".join(examples))
+    st.caption(
+        "After an answer, try a follow-up such as “What about West customer region?”, "
+        "“Now by warehouse”, or “And in cases?”."
+    )
     question = st.text_area(
         "Question",
         placeholder="Ask a service, cold-chain, leakage, freight, or price-position question…",
@@ -3876,6 +3926,8 @@ def render_ask(
                     filters=context.filters,
                     basis=context.basis,
                     definitions=definitions,
+                    settings=settings,
+                    conversation_memory=conversation_memory,
                 )
             if result.available:
                 section_header("Answer")
