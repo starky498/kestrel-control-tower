@@ -128,7 +128,7 @@ than hard-coding a second page list.
 
 | Plan / requirement | Artifact | Acceptance evidence | Status |
 |---|---|---|---|
-| One-command clean start (`REP-01`) | `Makefile`, `README.md` | `make start` creates env, doctor, validate, build, scrape, run | **Implemented; clean-checkout replay remains a handoff gate** |
+| One-command clean start (`REP-01`) | `Makefile`, `README.md` | `make start` creates env, doctor, validate, build, scrape, run | **Verified from a fresh public branch clone with the supplied pack; app health and 258 tests passed** |
 | Optional local intent setup | `Makefile`, `config/nlq_model.yml`, model downloader | `make setup-local-nlp` architecture-selects and SHA-256-verifies the public ONNX artifact under ignored `.kestrel/models/`; normal startup remains rules-only when absent | **Implemented; model download is optional and keyless** |
 | Version-pinned application/tool dependencies (`REP-02`) | `requirements.lock`, `requirements-dev.lock` | Docker and CI install locks then project `--no-deps`; base interpreter/build tooling is not bit-for-bit pinned | **Implemented** |
 | Local operation history (`OBS-01`) | `src/kestrel/observability.py`, CLI decorators | Paired STARTED + SUCCEEDED/FAILED JSONL for normal operations; successful cleanup clears prior logs and retains its final SUCCEEDED event | **Implemented; local doctor event verified** |
