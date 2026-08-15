@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
@@ -17,7 +17,12 @@ from kestrel.config import Settings
 from kestrel.metrics.context import ContextAnalyticsService, ContextAssociationResult
 from kestrel.metrics.definitions import MetricDefinition
 from kestrel.metrics.periods import Period, previous_period
-from kestrel.metrics.service import AnalyticsService, MetricValue, QuantityBasis
+from kestrel.metrics.service import (
+    RANKED_COLD_CHAIN_MIN_DELIVERIES,
+    AnalyticsService,
+    MetricValue,
+    QuantityBasis,
+)
 from kestrel.observability import read_recent_events
 from kestrel.ui.components import (
     GOLD,
@@ -886,7 +891,9 @@ def render_executive(
     ):
         with column:
             frame = _safe_dimension(
-                service.shortage_contributors(context.filters, dimension, limit=8)
+                service.shortage_contributors(
+                    context.filters, dimension, context.basis, limit=8
+                )
             )
             if frame.empty:
                 render_empty_state("No shortage rows", "No shortage evidence matched this scope.")
@@ -1143,7 +1150,9 @@ def render_service(
         key="kp_shortage_dimension",
     )
     shortage = _safe_dimension(
-        service.shortage_contributors(context.filters, selected_contributor, limit=20)
+        service.shortage_contributors(
+            context.filters, selected_contributor, context.basis, limit=20
+        )
     )
     amount_column = (
         "short_eaches" if context.basis == QuantityBasis.EACHES else "short_case_equivalents"
@@ -1742,7 +1751,11 @@ def render_cold_chain(
             _plot(_figure_layout(figure, height=360))
         render_source_note(str(cold_trend.attrs.get("severity_definition", "")))
 
-    section_header("Temperature-control hotspots")
+    section_header(
+        "Temperature-control hotspots",
+        "Ranked groups use a minimum chilled-delivery denominator for stability; the monthly "
+        "trend above remains unfiltered.",
+    )
     cold_dimensions = {
         "warehouse": "Warehouse",
         "route": "Route",
@@ -1760,11 +1773,32 @@ def render_cold_chain(
         format_func=cold_dimensions.get,
         key="kp_cold_dimension",
     )
-    hotspots = _safe_dimension(service.cold_chain_by_dimension(context.filters, selected, limit=20))
+    min_chilled_deliveries = int(
+        st.number_input(
+            "Minimum chilled deliveries per group",
+            min_value=1,
+            max_value=5_000,
+            value=RANKED_COLD_CHAIN_MIN_DELIVERIES,
+            step=5,
+            key="kp_cold_min_chilled_deliveries",
+        )
+    )
+    st.caption(
+        f"Only groups with at least {min_chilled_deliveries:,} eligible chilled deliveries are "
+        "ranked. Hover shows each group's exact denominator."
+    )
+    hotspots = _safe_dimension(
+        service.cold_chain_by_dimension(
+            context.filters,
+            selected,
+            min_chilled_deliveries=min_chilled_deliveries,
+            limit=20,
+        )
+    )
     if hotspots.empty:
         render_empty_state(
-            "No chilled deliveries",
-            "No eligible chilled deliveries match the selected reporting scope.",
+            "No volume-qualified chilled-delivery groups",
+            "No group meets the selected minimum chilled-delivery denominator in this scope.",
         )
     else:
         figure = px.bar(
@@ -1774,7 +1808,10 @@ def render_cold_chain(
             orientation="h",
             color="excursions",
             color_continuous_scale=[GOLD, RED],
-            title=f"Excursions per 100 by {cold_dimensions[selected].lower()}",
+            title=(
+                f"Excursions per 100 by {cold_dimensions[selected].lower()} · minimum "
+                f"{min_chilled_deliveries:,} chilled deliveries"
+            ),
             hover_data={
                 "chilled_deliveries": ":,",
                 "excursions": ":,",
@@ -1891,10 +1928,17 @@ def render_cold_chain(
             "blocked_stock_flag": st.column_config.CheckboxColumn("Blocked"),
         },
     )
+    total_batch_rows = int(batch_evidence.attrs.get("total_matching_rows", len(batch_evidence)))
+    st.caption(
+        f"Showing {len(batch_evidence):,} of {total_batch_rows:,} matching at-risk batch "
+        "row(s), ordered by urgency. Headline cards and aggregate charts use the complete "
+        "snapshot; this limit applies only to the evidence table."
+    )
     render_source_note(
         str(batch_evidence.attrs.get("grain", "Latest inventory batch snapshot evidence"))
     )
 
+    cold_return_summary = service.cold_chain_return_summary(context.filters)
     cold_returns = service.cold_chain_return_evidence(context.filters, limit=100)
     section_header(
         "Cold-chain return evidence",
@@ -1907,15 +1951,12 @@ def render_cold_chain(
             "No RT06 credit-note lines match this reporting scope and status contract.",
         )
     else:
-        approved = cold_returns.loc[cold_returns["credit_note_status"] == "APPROVED"]
-        value = float(approved["credit_note_value_inr"].sum())
-        lines = len(approved)
         render_metric_cards(
             [
                 MetricCard(
                     "Approved RT06 credit notes",
-                    format_inr(value),
-                    f"{lines:,} approved credit-note lines",
+                    format_inr(cold_return_summary.value),
+                    f"{cold_return_summary.records:,} approved credit-note lines",
                     tone="danger",
                 )
             ],
@@ -1955,6 +1996,14 @@ def render_cold_chain(
                 ),
             },
         )
+        total_return_rows = int(
+            cold_returns.attrs.get("total_matching_rows", len(cold_returns))
+        )
+        st.caption(
+            f"Showing {len(cold_returns):,} of {total_return_rows:,} matching RT06 evidence "
+            "line(s). The approved-value card above is calculated from the complete scope, "
+            "not this displayed row sample."
+        )
         render_source_note(
             str(cold_returns.attrs.get("grain", "One exact source credit-note line"))
             + ". "
@@ -1962,7 +2011,11 @@ def render_cold_chain(
         )
     render_definitions(
         definitions,
-        ["temperature_excursions_per_100", "near_expiry_cases", "approved_credit_note_rate"],
+        [
+            "temperature_excursions_per_100",
+            "near_expiry_cases",
+            "approved_credit_note_value_inr",
+        ],
     )
 
 
@@ -2018,6 +2071,21 @@ def _render_freight_frames(
     if primary_lens not in {"warehouse", "route"}:
         raise ValueError("primary_lens must be warehouse or route")
     primary = route if primary_lens == "route" else warehouse
+    coverage_warnings = tuple(
+        dict.fromkeys(
+            str(warning)
+            for frame in (warehouse, route, carrier, previous_route)
+            if frame is not None
+            for warning in (frame.attrs.get("coverage_warning"),)
+            if warning
+        )
+    )
+    if coverage_warnings:
+        render_callout(
+            "Freight coverage boundary",
+            " ".join(coverage_warnings),
+            tone="warning",
+        )
     billed = _sum_column(primary, "freight_cost_inr")
     detention = _sum_column(primary, "detention_cost_inr")
     paid = _sum_column(primary, "paid_cost_inr")
@@ -2180,7 +2248,7 @@ def _render_freight_frames(
         "Route cost rankings",
         "Best means the lowest current billed ratio among minimum-volume routes. "
         "Most improved compares the same ratio with the immediately preceding equal-length "
-        "period; lower is better.",
+        "effective freight period; lower is better.",
     )
     ranking_columns = st.columns(2)
     with ranking_columns[0]:
@@ -2221,7 +2289,14 @@ def _render_freight_frames(
         if sampled_current.empty or sampled_previous.empty:
             render_empty_state(
                 "No comparable prior route sample",
-                "Both periods must clear the 25-invoice and 25-delivery floor per route.",
+                str(
+                    (
+                        previous_route.attrs.get("unavailable_reason")
+                        if previous_route is not None
+                        else None
+                    )
+                    or "Both periods must clear the 25-invoice and 25-delivery floor per route."
+                ),
             )
         else:
             prior = sampled_previous[
@@ -2335,7 +2410,7 @@ def render_leakage(
             MetricCard(
                 "Approved credit-note leakage",
                 format_metric_value(credit),
-                "Approved credit notes divided by estimated delivered line value",
+                "All approved source notes ÷ eligible estimated dispatch value",
                 tone="danger",
             ),
             MetricCard(
@@ -2362,6 +2437,13 @@ def render_leakage(
             ),
         ],
         columns=4,
+    )
+    render_callout(
+        "Credit population boundary",
+        "The numerator includes every approved source credit-note line matching the return-date "
+        "and return-dimension filters. The denominator includes only eligible completed-service "
+        "dispatch estimates. They are separately aggregated populations, not a same-order ratio.",
+        tone="info",
     )
     render_callout(
         "Measured leakage, not profit",
@@ -2612,28 +2694,42 @@ def render_leakage(
             "freight_by_carrier",
             context.filters,
         )
-        active_period = Period(
-            context.filters.start_date,
-            context.filters.end_date,
-            context.period_label,
-        )
-        prior_period = previous_period(active_period)
         previous_route = pd.DataFrame()
-        if prior_period.end >= context.data_min_date:
-            bounded_prior = Period(
-                max(prior_period.start, context.data_min_date),
-                prior_period.end,
-                prior_period.label,
+        route_frame = (
+            route_result.payload
+            if route_result.available and isinstance(route_result.payload, pd.DataFrame)
+            else pd.DataFrame()
+        )
+        effective_period = route_frame.attrs.get("effective_period")
+        if (
+            isinstance(effective_period, tuple)
+            and len(effective_period) == 2
+            and isinstance(effective_period[0], date)
+            and isinstance(effective_period[1], date)
+        ):
+            active_period = Period(
+                effective_period[0],
+                effective_period[1],
+                "Effective freight period",
             )
+            prior_period = previous_period(active_period)
             previous_route_result = call_external(
                 external.payload,
                 "freight_by_route",
-                with_dates(context.filters, bounded_prior),
+                with_dates(context.filters, prior_period),
             )
             if previous_route_result.available and isinstance(
                 previous_route_result.payload, pd.DataFrame
             ):
-                previous_route = previous_route_result.payload
+                prior_candidate = previous_route_result.payload
+                if prior_candidate.attrs.get("coverage_clamped", False):
+                    previous_route.attrs.update(prior_candidate.attrs)
+                    previous_route.attrs["unavailable_reason"] = (
+                        "An equal-length prior route comparison is unavailable because observed "
+                        "freight coverage does not contain the complete prior window."
+                    )
+                else:
+                    previous_route = prior_candidate
         sync_result = call_external(external.payload, "sync_status")
         sync_frame = (
             sync_result.payload
@@ -3835,9 +3931,16 @@ def _guided_diagnostic(
             context.filters, "warehouse", context.basis, limit=10, worst_first=True
         )
     if diagnostic == "Largest shortage reasons":
-        return service.shortage_contributors(context.filters, "short_reason", limit=10)
+        return service.shortage_contributors(
+            context.filters, "short_reason", context.basis, limit=10
+        )
     if diagnostic == "Cold-chain hotspots":
-        return service.cold_chain_by_dimension(context.filters, "warehouse", limit=10)
+        return service.cold_chain_by_dimension(
+            context.filters,
+            "warehouse",
+            min_chilled_deliveries=RANKED_COLD_CHAIN_MIN_DELIVERIES,
+            limit=10,
+        )
     if diagnostic == "Approved credit-note drivers":
         return service.returns_by_dimension(
             context.filters, "reason", statuses=("APPROVED",), limit=10
@@ -3989,9 +4092,9 @@ def render_data_trust(
     render_metric_cards(
         [
             MetricCard(
-                "Operational date range",
+                "Governed reporting span",
                 f"{context.data_min_date:%d %b %y} – {context.data_max_date:%d %b %y}",
-                "Requested-delivery service range",
+                "Union of service, delivery, return, inventory, and available freight dates",
                 tone="info",
             ),
             MetricCard(

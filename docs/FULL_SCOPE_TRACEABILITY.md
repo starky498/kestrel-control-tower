@@ -47,7 +47,7 @@ Status meanings:
 | Preserve external state on rebuild (`DATA-04`) | `_preserve_external_objects` copies `external_sync_runs`, physical `ext_*`, and compatible views | Focused warehouse preservation/rollback tests | **Implemented** |
 | Portable analytical release (`DATA-03`) | 15 exported tables plus `.kestrel/parquet/manifest.json` | Manifest schema, source SHA-256, completion, and per-table counts tested | **Implemented** |
 | Normalize order creation (`DATA-05`) | ERP/SFA/partner parsers in `fct_order_line` and `fct_order_service` | Raw text + IST value + parse status; UTC `Z` conversion; warehouse consistency assertion; no KPI date-basis change | **Implemented** |
-| Version every published metric (`MET-01`) | `config/metrics.yml`, `MetricDefinition` loader, Trust Center table | 24 definitions, all version `1.0.0`; registry tests | **Implemented** |
+| Version every published metric (`MET-01`) | `config/metrics.yml`, `MetricDefinition` loader, Trust Center table | 24 definitions: 22 at `1.0.0` and two freight metrics at `1.1.0`; registry tests | **Implemented** |
 | Single typed query boundary (`MET-02`) | `AnalyticsService`, `ExternalAnalyticsService`, `ContextAnalyticsService` | Service, external, context, NLQ, and UI registry tests | **Implemented** |
 
 ## Metric and decision traceability
@@ -62,7 +62,7 @@ Status meanings:
 | Open demand requiring attention | `overdue_backlog_orders` | Current OPEN status as of selected period end, not historical reconstruction | **Implemented** |
 | Actual-delivery operation | `delivery_on_time_rate`, `delivery_late_over_2h_rate` | Actual-date cohort is separate from promise cohort | **Implemented** |
 | Evidence completeness/conflict | `pod_coverage_rate`, `delay_source_conflict_rate`, `recorded_failure_rate` | Recorded evidence signals do not prove responsibility | **Implemented** |
-| Chilled-delivery risk | `temperature_excursions_per_100` | Distinct chilled delivery; source flag; non-chilled flags excluded | **Implemented** |
+| Chilled-delivery risk | `temperature_excursions_per_100` | Distinct chilled delivery; source flag; non-chilled flags excluded; ranked dimensions default to a visible 25-delivery floor while monthly trend remains unfiltered | **Implemented** |
 | Expiring inventory exposure | `near_expiry_cases` | Latest eligible weekly snapshot; 0–30 day configurable window | **Implemented** |
 | Gross commercial leakage | `approved_credit_note_rate` | Approved value / estimated delivered dispatch value; not profit | **Implemented** |
 | Logistics cost | `settled_freight_cost_per_case`, `freight_cost_per_case` | PAID settled primary and billed secondary; independent period × DC/route aggregation; no invoice-delivery key | **Implemented** |

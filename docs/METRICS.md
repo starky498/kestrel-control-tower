@@ -7,7 +7,8 @@ eligible population, numerator, denominator, unit, status, and warning in
 `config/metrics.yml`. The dashboard and Ask Kestrel load that registry and call the same
 parameterized metric services. Presentation code does not redefine a formula.
 
-The current registry contains 24 definitions, all at version `1.0.0`:
+The current registry contains 24 definitions: 22 at version `1.0.0` and the two freight metrics at
+version `1.1.0` after adding explicit source-coverage intersection semantics:
 
 | Family | Metric key | Formula summary | Grain and canonical date |
 |---|---|---|---|
@@ -148,6 +149,12 @@ Each delivery counts once. The source excursion flag is governed because recorde
 temperature does not reliably explain it. An excursion flag on a non-chilled delivery is a data
 quality exception and is excluded from this KPI.
 
+Ranked warehouse, route, customer, channel, category, promotion, and order-source hotspot views
+apply a minimum of 25 eligible chilled deliveries per group by default. The volume floor is applied
+before ranking and row limits, the exact denominator remains visible, and changing the floor changes
+inclusion only—not the source-flag formula. The monthly cold-chain trend is deliberately unfiltered
+by this ranking floor so every month with an eligible chilled-delivery denominator remains visible.
+
 Near-expiry inventory sums positive `available_cases` with expiry days from zero through the
 configured window, 30 days by default, at the latest weekly snapshot on or before the selected
 period end. The snapshot date and threshold travel with the result. Inventory is not interpolated
@@ -172,10 +179,12 @@ short-delivery booked-value exposure =
     sum(line_value_inr × max(ordered_qty − delivered_qty, 0) / ordered_qty)
 ```
 
-The numerator is grouped by return date; the dispatch denominator is grouped by requested delivery
-date over the same selected range. Approved notes form the headline. Pending and rejected values
-remain visible separately. Return quantities are normalized with the originating line's order-time
-pack and sign rules.
+The numerator includes every APPROVED source credit-note line matching the return-date and active
+return dimensions; it does not inherit completed-service eligibility. The dispatch denominator is
+limited to eligible completed-service lines and grouped by requested delivery date over the same
+selected range. These are deliberately separate populations, not a same-order return ratio.
+Pending and rejected values remain visible separately. Return quantities are normalized with the
+originating line's order-time pack and sign rules.
 
 The dispatch fraction is capped per line, so oversupply cannot inflate the denominator. Ask
 Kestrel ranks only APPROVED value by the requested category/reason dimension and appends a separate
@@ -213,14 +222,23 @@ route where defensible), then divided. There is no invoice-to-delivery row join.
 outlet, and channel filters cannot apply symmetrically and are ignored with disclosure rather than
 being applied to one side.
 
+That common period is the intersection of the requested calendar window and the observed minimum
+and maximum `ext_freight_invoice_current.service_date`. The effective boundaries constrain both the
+invoice `service_date` numerator and eligible `fct_order_service.delivery_date` denominator. A
+partial overlap is calculated only over that disclosed intersection; a window wholly outside
+observed freight coverage is reported as unavailable, not as zero. Carrier-spend views use the same
+effective invoice period.
+
 The primary card is `settled_freight_cost_per_case`: PAID invoice amount plus detention divided by
 delivered case-equivalents. The all-status `freight_cost_per_case` remains an explicitly billed
 secondary view, with pending and disputed components stated separately. Carrier invoice spend is
 valid. Carrier-attributed delivered cases or carrier cost per case are not available because
 operational deliveries contain no carrier key. Driver-entered fuel cost is not used as carrier
 freight. Route tables can rank the lowest current billed ratio, worst ratio, and most improved
-ratio only after the stated invoice/delivery volume gates; this remains an aggregate comparison,
-not row-level attribution.
+ratio only after the stated invoice/delivery volume gates. For a partially covered current window,
+the prior comparison is the immediately preceding window with the same length as the effective
+current period; if source coverage cannot contain that complete prior window, the comparison is
+unavailable. This remains an aggregate comparison, not row-level attribution.
 
 The optional full refresh requests invoice dates 2025-01-01 through 2026-06-30. Verified evidence
 contains 41,500 invoices over 208 pages, 237 requests, and 29 retries. Observed service dates begin
@@ -294,6 +312,12 @@ route or outlet observation, and the national calendar is not a state-specific c
 | Weather association | Actual delivery date × warehouse code |
 | Holiday association | Requested delivery date |
 
+The global **Full history** preset spans the union of requested-delivery, actual-delivery, return,
+inventory, and available freight-service dates. This prevents a fact near the edge of its own
+history from being silently excluded merely because the requested-delivery fact starts later or
+ends sooner. Each metric still filters on its canonical date above, so different pages can
+legitimately have different record counts inside the same selected calendar window.
+
 Customer region, origin/DC region, DC, route, outlet, channel, category, recorded order source, and
 recorded promotion are distinct allowlisted dimensions where the underlying fact has those keys. A
 page or query applies only filters that are defensible for all components and discloses any ignored
@@ -316,6 +340,9 @@ KPI uses order creation time; service and delivery cohorts continue to use their
 6. Raw conflict fields and the chosen normalized interpretation coexist.
 7. “Why,” “driver,” and “performer” outputs mean measured contribution or association unless a
    causal design exists. This system contains no causal design.
+8. Row-level evidence tables may use a disclosed display limit for usability. Their captions show
+   displayed versus matching rows, while headline cards and aggregate charts are computed from the
+   complete filtered population rather than the displayed sample.
 
 ## Semantic version policy
 

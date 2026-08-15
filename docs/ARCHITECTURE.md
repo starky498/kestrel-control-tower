@@ -56,7 +56,7 @@ flowchart TB
     CACHE --> EXT["Transactional ext_* current/history tables"]
     EXT --> DB
 
-    PROMOTE --> METRIC["Allowlisted metric services\nand version 1.0.0 registry"]
+    PROMOTE --> METRIC["Allowlisted metric services\n22 v1.0.0 + 2 freight v1.1.0"]
     METRIC --> UI["Eight Streamlit workspaces"]
     RULES["Exact rules and conservative spelling"] --> ASK["Typed Ask Kestrel intent"]
     LOCAL["Optional local MiniLM\nparaphrase matching"] -. "finite intent only" .-> ASK
@@ -81,7 +81,7 @@ it; a missing MiniLM model leaves Ask Kestrel in rules-only mode.
 | Executive Command Center | Where service, risk, measured leakage, settled freight, and market coverage require attention | Both fill bases, governed ratios/volumes, exception inbox, and qualified worst/best/improved groups |
 | Service & Fulfilment | Which promise, allocation, fulfilment, source, and recorded-promotion segments underperform | Requested-delivery line cohort; ordered → allocated → delivered → linked return; eaches default, case-equivalents selectable |
 | Delivery & Exception Drivers | Which operational exceptions are associated with late delivery | Actual-delivery cohort; minimum-volume guard; no causal or blame claim |
-| Cold Chain & Inventory Risk | Where chilled delivery severity and expiring/damaged/blocked batches concentrate | Distinct-delivery excursion grain and max-temperature evidence; latest eligible weekly batch snapshot |
+| Cold Chain & Inventory Risk | Where chilled delivery severity and expiring/damaged/blocked batches concentrate | Distinct-delivery excursion grain; unfiltered monthly trend; volume-qualified dimensional hotspots; latest eligible weekly batch snapshot |
 | Commercial Leakage & Logistics Cost | Which measured credits, short-delivery exposures, dispositions, and carrier invoices are material | PAID settled freight is primary; separate return, delivery, and invoice facts; not accounting profit or recovery |
 | Market & External Context | Where current/effective-dated MRP differs from current or source-dated governed shelf observations and optional context cohorts differ | Raw and 100G/100ML price evidence, high-confidence final matches, and publication-gated descriptive associations |
 | Ask Kestrel | Reusable management questions with evidence | Rules-first typed router, spelling support, session follow-ups, and optional local semantic intent matching call the same metric services; no unrestricted SQL or generated formulas |

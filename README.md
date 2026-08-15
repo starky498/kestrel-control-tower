@@ -21,9 +21,10 @@ logs, and audit outputs are deliberately excluded from Git.
    contributors, booked-value exposure, and native order-line evidence.
 3. **Delivery & Exception Drivers** — actual-delivery-cohort on-time, more-than-two-hours-late,
    POD, delay-source conflict, recorded failure-label Pareto, volume guards, and evidence rows.
-4. **Cold Chain & Inventory Risk** — monthly excursion/severity trends, maximum temperature by
-   warehouse/route/category, near-expiry and batch evidence, inventory filter boundaries, and exact
-   RT06 return lines with status/raw/normalized quantity evidence.
+4. **Cold Chain & Inventory Risk** — unfiltered monthly excursion/severity trends, volume-qualified
+   maximum-temperature hotspots by warehouse/route/category, near-expiry and batch evidence,
+   inventory filter boundaries, and exact RT06 return lines with status/raw/normalized quantity
+   evidence.
 5. **Commercial Leakage & Logistics Cost** — approved-credit and short-delivery booked-value
    exposure, recorded restock/scrap/vendor-return dispositions, **PAID settled freight per delivered
    case-equivalent** as the primary cost card, plus billed/pending/disputed status and route/carrier
@@ -268,7 +269,8 @@ model, so its default Ask Kestrel behavior is the rules-only fallback. See
 
 ## Metric and trust stance
 
-All 24 published definitions carry semantic version `1.0.0` in `config/metrics.yml`. Dashboard
+The registry contains 22 definitions at semantic version `1.0.0` and two freight definitions at
+`1.1.0` in `config/metrics.yml`. Dashboard
 cards and Ask Kestrel call allowlisted metric services; they do not reinterpret raw tables.
 
 | Metric family | Governed calculation / boundary |

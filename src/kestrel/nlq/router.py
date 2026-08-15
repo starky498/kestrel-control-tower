@@ -23,7 +23,12 @@ from kestrel.metrics.periods import (
     last_complete_month,
     latest_complete_fiscal_quarter,
 )
-from kestrel.metrics.service import FilterSet, MetricValue, QuantityBasis
+from kestrel.metrics.service import (
+    RANKED_COLD_CHAIN_MIN_DELIVERIES,
+    FilterSet,
+    MetricValue,
+    QuantityBasis,
+)
 from kestrel.nlq.semantic import SemanticIntentResolver, SemanticStatus
 
 
@@ -318,7 +323,12 @@ class MetricService(Protocol):
     def failure_reason_pareto(self, filters: FilterSet, *, limit: int = 20) -> pd.DataFrame: ...
 
     def cold_chain_by_dimension(
-        self, filters: FilterSet, dimension: str, *, limit: int = 20
+        self,
+        filters: FilterSet,
+        dimension: str,
+        *,
+        min_chilled_deliveries: int = 1,
+        limit: int = 20,
     ) -> pd.DataFrame: ...
 
     def returns_by_dimension(
@@ -337,7 +347,12 @@ class MetricService(Protocol):
     ) -> pd.DataFrame: ...
 
     def shortage_contributors(
-        self, filters: FilterSet, dimension: str, *, limit: int = 20
+        self,
+        filters: FilterSet,
+        dimension: str,
+        basis: QuantityBasis = QuantityBasis.EACHES,
+        *,
+        limit: int = 20,
     ) -> pd.DataFrame: ...
 
     def short_delivery_exposure(
@@ -1578,9 +1593,13 @@ def _format_percent(value: object) -> str:
     if value is None:
         return "not available"
     numeric = _as_float(value)
-    displayed_percent = abs(numeric * 100)
-    decimals = 3 if 0 < displayed_percent < 0.1 else 1
-    return f"{numeric:.{decimals}%}"
+    displayed_percent = numeric * 100
+    absolute = abs(displayed_percent)
+    if 0 < absolute < 0.001:
+        return "<0.001%" if displayed_percent > 0 else ">-0.001%"
+    if 0 < absolute < 0.1:
+        return f"{displayed_percent:.3f}%"
+    return f"{displayed_percent:.1f}%"
 
 
 def _format_number(value: object) -> str:
@@ -2060,10 +2079,10 @@ class QuestionRouter:
             ("warehouse", "Warehouse shortage contribution"),
         ):
             current_frame = self.metric_service.shortage_contributors(
-                filters, dimension, limit=100
+                filters, dimension, intent.quantity_basis, limit=100
             )
             previous_frame = self.metric_service.shortage_contributors(
-                previous_filters, dimension, limit=100
+                previous_filters, dimension, intent.quantity_basis, limit=100
             )
             current_projection = current_frame[["dimension_value", short_column]].rename(
                 columns={short_column: "current_short_quantity"}
@@ -2580,9 +2599,11 @@ class QuestionRouter:
             f"₹{_format_number(metric.numerator)} in approved credit-note value.",
             tuple(blocks),
             warnings=(
-                "The overall rate independently aggregates return-date credit notes and "
-                "requested-date delivered value. Grouped evidence is value, not a grouped rate; "
-                "none of these measures is accounting profit or cash recovery.",
+                "The numerator includes all approved source credit notes matching return filters; "
+                "the denominator includes only eligible completed-service dispatch estimates. "
+                "They are independent populations on return and requested-delivery dates. Grouped "
+                "evidence is value, not a grouped rate; none of these measures is accounting "
+                "profit or cash recovery.",
             ),
         )
 
@@ -2759,7 +2780,10 @@ class QuestionRouter:
         if intent.dimensions:
             dimension = intent.dimensions[0]
             frame = self.metric_service.cold_chain_by_dimension(
-                filters, dimension.value, limit=1_000
+                filters,
+                dimension.value,
+                min_chilled_deliveries=RANKED_COLD_CHAIN_MIN_DELIVERIES,
+                limit=1_000,
             )
             frame = frame.sort_values(
                 "excursions_per_100",
@@ -2767,14 +2791,27 @@ class QuestionRouter:
                 na_position="last",
             ).head(intent.limit or 20)
             evidence = _frame_evidence("Chilled excursion breakdown", "fct_delivery", frame)
-            summary = (
-                "No chilled-delivery groups were found."
-                if frame.empty
-                else f"{frame.iloc[0]['dimension_value']} has the "
-                f"{_ranking_label(intent, adverse=True)} rate at "
-                f"{_format_number(frame.iloc[0]['excursions_per_100'])} per 100."
+            if frame.empty:
+                summary = "No chilled-delivery groups were found."
+            else:
+                leading = frame.iloc[0]
+                chilled_deliveries = int(leading["chilled_deliveries"])
+                summary = (
+                    f"{leading['dimension_value']} has the "
+                    f"{_ranking_label(intent, adverse=True)} rate at "
+                    f"{_format_number(leading['excursions_per_100'])} per 100 across "
+                    f"{chilled_deliveries:,} chilled deliveries."
+                )
+            return self._base_answer(
+                intent,
+                summary,
+                (evidence,),
+                warnings=(
+                    "Ranked dimensional cold-chain results exclude groups with fewer than "
+                    f"{RANKED_COLD_CHAIN_MIN_DELIVERIES} eligible chilled deliveries. This "
+                    "changes inclusion only; the source-flag excursion formula is unchanged.",
+                ),
             )
-            return self._base_answer(intent, summary, (evidence,))
 
         metric = self.metric_service.executive_summary(filters)["temperature_excursions_per_100"]
         evidence = EvidenceBlock(
@@ -2858,12 +2895,14 @@ class QuestionRouter:
         unavailable_reason = frame.attrs.get("unavailable_reason")
         if frame.empty and unavailable_reason:
             spec = _SPECS[intent.metric]
+            coverage_warning = frame.attrs.get("coverage_warning")
             return QuestionAnswer(
                 status=AnswerStatus.INTEGRATION_REQUIRED,
                 summary=str(unavailable_reason),
                 interpretation=intent.interpretation(),
                 definition=spec.definition,
                 sources=spec.sources,
+                warnings=(str(coverage_warning),) if coverage_warning else (),
                 intent=intent,
             )
         if intent.ranking != Ranking.NONE:
@@ -3034,8 +3073,11 @@ class QuestionRouter:
                     f"{_ranking_label(intent, adverse=True)} settled/paid freight per "
                     f"delivered case at ₹{_format_number(first[settled_column])}."
                 )
+        coverage_warning = frame.attrs.get("coverage_warning")
         attribution = frame.attrs.get("attribution")
-        warnings_list = [str(attribution)] if attribution else []
+        warnings_list = [str(coverage_warning)] if coverage_warning else []
+        if attribution:
+            warnings_list.append(str(attribution))
         ignored_filters = tuple(frame.attrs.get("ignored_filters", ()))
         if ignored_filters:
             warnings_list.append(

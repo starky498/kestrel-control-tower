@@ -36,9 +36,10 @@ def _external_database(path: Path) -> None:
                 is_eligible_service BOOLEAN
             );
             INSERT INTO fct_order_service VALUES
-                ('WH01', 'RT0001', DATE '2026-05-15', 100, TRUE),
+                ('WH01', 'RT0001', DATE '2026-05-17', 100, TRUE),
                 ('WH01', 'RT0001', DATE '2026-06-14', 60, TRUE),
-                ('WH01', 'RT0001', DATE '2026-06-15', 40, TRUE);
+                ('WH01', 'RT0001', DATE '2026-06-15', 40, TRUE),
+                ('WH01', 'RT0001', DATE '2026-06-20', 1000, TRUE);
 
             CREATE TABLE ext_freight_invoice_current (
                 invoice_id VARCHAR,
@@ -53,7 +54,7 @@ def _external_database(path: Path) -> None:
             );
             INSERT INTO ext_freight_invoice_current VALUES
                 ('FI-0', 'CR-1', 'Carrier One', 'WH01', 'RT0001',
-                 DATE '2026-05-15', 1500, 0, 'PAID'),
+                 DATE '2026-05-17', 1500, 0, 'PAID'),
                 ('FI-1', 'CR-1', 'Carrier One', 'WH01', 'RT0001',
                  DATE '2026-06-14', 1000, 100, 'PAID'),
                 ('FI-2', 'CR-1', 'Carrier One', 'WH01', 'RT0001',
@@ -146,7 +147,38 @@ def test_freight_cost_per_case_uses_independent_warehouse_aggregates(
     assert frame.iloc[0]["delivered_case_equivalents"] == 100
     assert frame.iloc[0]["settled_freight_cost_per_delivered_case_inr"] == 10
     assert frame.iloc[0]["freight_cost_per_delivered_case_inr"] == 11
+    assert frame.attrs["requested_period"] == (date(2026, 6, 1), date(2026, 6, 30))
+    assert frame.attrs["source_coverage"] == (date(2026, 5, 17), date(2026, 6, 15))
+    assert frame.attrs["effective_period"] == (date(2026, 6, 1), date(2026, 6, 15))
+    assert frame.attrs["coverage_clamped"] is True
+    assert "eligible actual-delivery dates" in frame.attrs["coverage_warning"]
     assert "independently aggregated" in frame.attrs["attribution"]
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    ["freight_by_warehouse", "freight_by_route", "freight_by_carrier"],
+)
+def test_freight_period_wholly_outside_source_coverage_is_unavailable(
+    tmp_path: Path,
+    method_name: str,
+) -> None:
+    database = tmp_path / "external.duckdb"
+    _external_database(database)
+    service = ExternalAnalyticsService(database)
+    outside = FilterSet(start_date=date(2026, 7, 1), end_date=date(2026, 7, 31))
+
+    frame = getattr(service, method_name)(outside)
+
+    assert frame.empty
+    assert frame.attrs["requested_period"] == (date(2026, 7, 1), date(2026, 7, 31))
+    assert frame.attrs["source_coverage"] == (date(2026, 5, 17), date(2026, 6, 15))
+    assert frame.attrs["effective_period"] is None
+    assert frame.attrs["coverage_available"] is False
+    assert frame.attrs["coverage_clamped"] is True
+    assert "lies outside observed invoice service-date coverage" in frame.attrs[
+        "unavailable_reason"
+    ]
 
 
 def test_freight_reports_filters_that_cannot_be_attributed(tmp_path: Path) -> None:
@@ -238,7 +270,16 @@ def test_route_performance_uses_prior_equivalent_period_and_evidence_floors(
     assert row["prior_freight_cost_per_delivered_case_inr"] == 15
     assert row["cost_per_case_delta_inr"] == -4
     assert row["cost_per_case_delta_pct"] == pytest.approx(-26.6666667)
-    assert frame.attrs["prior_period"] == (date(2026, 5, 2), date(2026, 5, 31))
+    assert frame.attrs["current_effective_period"] == (
+        date(2026, 6, 1),
+        date(2026, 6, 15),
+    )
+    assert frame.attrs["prior_period"] == (date(2026, 5, 17), date(2026, 5, 31))
+    assert frame.attrs["prior_effective_period"] == (
+        date(2026, 5, 17),
+        date(2026, 5, 31),
+    )
+    assert frame.attrs["coverage_clamped"] is True
 
 
 def test_route_performance_rejects_invalid_ranking_and_floors(tmp_path: Path) -> None:

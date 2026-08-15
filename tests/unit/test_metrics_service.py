@@ -194,6 +194,32 @@ def test_available_date_range_defaults_to_requested_delivery_and_rejects_unknown
         service.available_date_range("requested_delivery; DROP TABLE fct_delivery")
 
 
+def test_available_reporting_date_range_covers_all_core_metric_dates(
+    service: AnalyticsService,
+) -> None:
+    assert service.available_reporting_date_range() == (
+        date(2026, 3, 11),
+        date(2026, 4, 27),
+    )
+
+
+def test_available_reporting_date_range_includes_freight_when_present(
+    service: AnalyticsService,
+) -> None:
+    with duckdb.connect(str(service.database_path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE ext_freight_invoice_current AS
+            SELECT DATE '2026-03-01' AS service_date
+            """
+        )
+
+    assert service.available_reporting_date_range() == (
+        date(2026, 3, 1),
+        date(2026, 4, 27),
+    )
+
+
 def test_executive_summary_uses_weighted_ratio_of_sums(service: AnalyticsService) -> None:
     filters = FilterSet(date(2026, 4, 1), date(2026, 4, 30))
     summary = service.executive_summary(filters, QuantityBasis.EACHES)
@@ -371,6 +397,33 @@ def test_service_dimension_volume_floor_is_explicit(service: AnalyticsService) -
         service.service_by_dimension(filters, "warehouse", min_orders=0)
 
 
+def test_shortage_contributors_top_n_uses_selected_quantity_basis(
+    service: AnalyticsService,
+) -> None:
+    with duckdb.connect(str(service.database_path)) as connection:
+        connection.execute(
+            """
+            UPDATE fct_order_line
+            SET short_eaches = CASE order_line_id WHEN 1001 THEN 9 ELSE 1 END,
+                short_case_equivalents = CASE order_line_id WHEN 1001 THEN 0.1 ELSE 0.5 END
+            WHERE order_line_id IN (1001, 1002)
+            """
+        )
+
+    filters = FilterSet(date(2026, 4, 1), date(2026, 4, 30))
+    eaches = service.shortage_contributors(
+        filters, "category", QuantityBasis.EACHES, limit=1
+    )
+    cases = service.shortage_contributors(
+        filters, "category", QuantityBasis.CASE_EQUIVALENTS, limit=1
+    )
+
+    assert eaches["dimension_value"].tolist() == ["Dairy"]
+    assert cases["dimension_value"].tolist() == ["Frozen"]
+    assert eaches.attrs["quantity_basis"] == "eaches"
+    assert cases.attrs["quantity_basis"] == "case_equivalents"
+
+
 def test_service_rankings_apply_volume_and_comparable_period_rules(
     service: AnalyticsService,
 ) -> None:
@@ -502,7 +555,43 @@ def test_cold_chain_severity_evidence_supports_month_category_route_and_warehous
     assert category.attrs["grain"] == "One delivery × chilled-category pair"
     assert not warehouse.empty
     assert trend["dimension_value"].tolist() == [pd.Timestamp("2026-04-01")]
+    assert trend.iloc[0]["chilled_deliveries"] == 2
+    assert trend.attrs["min_chilled_deliveries"] == 1
     assert "not validated food-safety limits" in route.attrs["severity_definition"]
+
+
+def test_cold_chain_rankings_apply_minimum_chilled_delivery_floor_before_limit(
+    service: AnalyticsService,
+) -> None:
+    filters = FilterSet(date(2026, 4, 1), date(2026, 4, 30))
+    with duckdb.connect(str(service.database_path)) as connection:
+        connection.execute(
+            """
+            INSERT INTO fct_delivery
+            SELECT * REPLACE (3 AS delivery_id)
+            FROM fct_delivery
+            WHERE delivery_id = 2
+            """
+        )
+
+    raw = service.cold_chain_by_dimension(filters, "route", limit=1)
+    qualified = service.cold_chain_by_dimension(
+        filters,
+        "route",
+        min_chilled_deliveries=2,
+        limit=1,
+    )
+
+    assert raw["dimension_value"].tolist() == ["RT0001"]
+    assert qualified["dimension_value"].tolist() == ["RT0002"]
+    assert qualified.iloc[0]["chilled_deliveries"] == 2
+    assert qualified.attrs["min_chilled_deliveries"] == 2
+    with pytest.raises(ValueError, match="min_chilled_deliveries must be positive"):
+        service.cold_chain_by_dimension(
+            filters,
+            "route",
+            min_chilled_deliveries=0,
+        )
 
 
 def test_inventory_batch_evidence_is_latest_as_of_and_discloses_filter_boundary(
@@ -521,6 +610,8 @@ def test_inventory_batch_evidence_is_latest_as_of_and_discloses_filter_boundary(
     assert frame["batch_id"].tolist() == ["B-1"]
     assert bool(frame.iloc[0]["near_expiry_flag"])
     assert frame.attrs["snapshot_date"] == date(2026, 4, 27)
+    assert frame.attrs["total_matching_rows"] == 1
+    assert frame.attrs["row_limit"] == 200
     assert frame.attrs["ignored_filters"] == (
         "customer region",
         "promotion",
@@ -555,6 +646,38 @@ def test_return_disposition_keeps_restock_scrap_and_vendor_recovery_semantics(
     assert frame.iloc[0]["approved_lines"] == 1
     assert frame.iloc[0]["approved_credit_note_value_inr"] == 50
     assert "not proof of cash receipt" in frame.attrs["warning"]
+
+
+def test_cold_chain_return_summary_is_not_limited_by_evidence_rows(
+    service: AnalyticsService,
+) -> None:
+    filters = FilterSet(date(2026, 4, 1), date(2026, 4, 30))
+    with duckdb.connect(str(service.database_path)) as connection:
+        connection.execute(
+            """
+            INSERT INTO fct_return_credit_note
+            SELECT 2 AS return_id, return_date, customer_region_name,
+                   warehouse_region_name, warehouse_code, route_code, outlet_code,
+                   channel, credit_note_status, 75.0 AS credit_note_value_inr,
+                   'CN-2' AS credit_note_number, order_id, order_line_id,
+                   outlet_name, sku_code, product_name, qty_uom, return_qty_raw,
+                   return_qty_normalized, return_sign_was_negative, return_eaches,
+                   return_case_equivalents, return_reason_code, is_cold_chain_return,
+                   disposition, source_system, promotion_code, promotion_name,
+                   promotion_mechanic, promotion_applied
+            FROM fct_return_credit_note
+            WHERE return_id = 1
+            """
+        )
+
+    evidence = service.cold_chain_return_evidence(filters, limit=1)
+    summary = service.cold_chain_return_summary(filters)
+
+    assert len(evidence) == 1
+    assert summary.records == 2
+    assert summary.value == pytest.approx(125.0)
+    assert evidence.attrs["total_matching_rows"] == 2
+    assert evidence.attrs["row_limit"] == 1
 
 
 def test_cold_chain_returns_keep_exact_line_and_normalized_quantity_evidence(

@@ -7,7 +7,7 @@ an empty, schema-stable frame instead of making the main operational dashboard u
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -16,6 +16,85 @@ import duckdb
 import pandas as pd
 
 from kestrel.metrics.service import FilterSet
+
+
+@dataclass(frozen=True)
+class _FreightPeriodScope:
+    """Requested freight dates intersected with observed invoice-service coverage."""
+
+    requested_start: date
+    requested_end: date
+    coverage_start: date | None
+    coverage_end: date | None
+    effective_start: date | None
+    effective_end: date | None
+
+    @property
+    def available(self) -> bool:
+        return self.effective_start is not None and self.effective_end is not None
+
+    @property
+    def clamped(self) -> bool:
+        return not self.available or (
+            self.effective_start != self.requested_start
+            or self.effective_end != self.requested_end
+        )
+
+    @staticmethod
+    def _label(start: date, end: date) -> str:
+        return f"{start:%d %b %Y} to {end:%d %b %Y}"
+
+    @property
+    def warning(self) -> str | None:
+        requested = self._label(self.requested_start, self.requested_end)
+        if self.coverage_start is None or self.coverage_end is None:
+            return (
+                f"The requested freight period {requested} is unavailable because the partner "
+                "snapshot has no observed invoice service-date coverage."
+            )
+        coverage = self._label(self.coverage_start, self.coverage_end)
+        if self.effective_start is None or self.effective_end is None:
+            return (
+                f"The requested freight period {requested} lies outside observed invoice "
+                f"service-date coverage ({coverage}); freight metrics are unavailable."
+            )
+        if self.clamped:
+            effective = self._label(self.effective_start, self.effective_end)
+            return (
+                f"The requested freight period {requested} was restricted to {effective}, the "
+                f"intersection with observed invoice service-date coverage ({coverage}). Both "
+                "invoice service dates and eligible actual-delivery dates use this effective "
+                "period."
+            )
+        return None
+
+    def effective_filters(self, filters: FilterSet) -> FilterSet:
+        if self.effective_start is None or self.effective_end is None:
+            raise ValueError("An unavailable freight scope has no effective filters")
+        return replace(
+            filters,
+            start_date=self.effective_start,
+            end_date=self.effective_end,
+        )
+
+    def attach(self, frame: pd.DataFrame) -> None:
+        frame.attrs["requested_period"] = (self.requested_start, self.requested_end)
+        frame.attrs["effective_period"] = (
+            (self.effective_start, self.effective_end) if self.available else None
+        )
+        frame.attrs["source_coverage"] = (
+            (self.coverage_start, self.coverage_end)
+            if self.coverage_start is not None and self.coverage_end is not None
+            else None
+        )
+        frame.attrs["coverage_available"] = self.available
+        frame.attrs["coverage_clamped"] = self.clamped
+        frame.attrs["date_alignment"] = (
+            "Invoice service_date and eligible actual delivery_date are constrained to the same "
+            "effective freight period."
+        )
+        if self.warning:
+            frame.attrs["coverage_warning"] = self.warning
 
 
 class ExternalAnalyticsService:
@@ -152,6 +231,91 @@ class ExternalAnalyticsService:
             ignored.append("route (independent route lens)")
         return tuple(ignored)
 
+    @staticmethod
+    def _freight_period_scope(
+        connection: duckdb.DuckDBPyConnection,
+        filters: FilterSet,
+    ) -> _FreightPeriodScope:
+        coverage_start, coverage_end = connection.execute(
+            """
+            SELECT min(service_date), max(service_date)
+            FROM ext_freight_invoice_current
+            """
+        ).fetchone()
+        if not isinstance(coverage_start, date) or not isinstance(coverage_end, date):
+            return _FreightPeriodScope(
+                filters.start_date,
+                filters.end_date,
+                None,
+                None,
+                None,
+                None,
+            )
+        candidate_start = max(filters.start_date, coverage_start)
+        candidate_end = min(filters.end_date, coverage_end)
+        effective_start: date | None = candidate_start
+        effective_end: date | None = candidate_end
+        if candidate_start > candidate_end:
+            effective_start, effective_end = None, None
+        return _FreightPeriodScope(
+            filters.start_date,
+            filters.end_date,
+            coverage_start,
+            coverage_end,
+            effective_start,
+            effective_end,
+        )
+
+    def _attach_freight_route_performance_attrs(
+        self,
+        frame: pd.DataFrame,
+        *,
+        filters: FilterSet,
+        current: pd.DataFrame,
+        prior: pd.DataFrame | None,
+        prior_period: tuple[date, date] | None,
+        ranking: str,
+    ) -> None:
+        frame.attrs["ranking"] = ranking
+        frame.attrs["current_period"] = (filters.start_date, filters.end_date)
+        frame.attrs["current_effective_period"] = current.attrs.get("effective_period")
+        frame.attrs["prior_period"] = prior_period
+        frame.attrs["prior_effective_period"] = (
+            prior.attrs.get("effective_period") if prior is not None else None
+        )
+        frame.attrs["requested_period"] = current.attrs.get(
+            "requested_period", (filters.start_date, filters.end_date)
+        )
+        frame.attrs["effective_period"] = current.attrs.get("effective_period")
+        frame.attrs["source_coverage"] = current.attrs.get("source_coverage")
+        frame.attrs["coverage_available"] = bool(
+            current.attrs.get("coverage_available", False)
+        )
+        frame.attrs["coverage_clamped"] = bool(
+            current.attrs.get("coverage_clamped", False)
+            or (prior is not None and prior.attrs.get("coverage_clamped", False))
+        )
+        warnings = tuple(
+            dict.fromkeys(
+                str(warning)
+                for source in (current, prior)
+                if source is not None
+                for warning in (source.attrs.get("coverage_warning"),)
+                if warning
+            )
+        )
+        if warnings:
+            frame.attrs["coverage_warning"] = " ".join(warnings)
+        frame.attrs["ignored_filters"] = self._ignored_freight_filters(
+            filters, lens="route"
+        )
+        frame.attrs["attribution"] = (
+            "Current and prior invoice numerators and delivery denominators are independently "
+            "aggregated at effective period × route. The prior window is the immediately "
+            "preceding equal-length effective period. Lower cost/case is better; no carrier "
+            "attribution or causal claim is made."
+        )
+
     def freight_by_warehouse(self, filters: FilterSet) -> pd.DataFrame:
         """Billed freight per delivered case-equivalent, aggregated independently by warehouse.
 
@@ -175,21 +339,49 @@ class ExternalAnalyticsService:
             "settled_freight_cost_per_delivered_case_inr",
             "freight_cost_per_delivered_case_inr",
         ]
+        attribution = (
+            "Invoice numerator and delivered-case denominator are independently aggregated at "
+            "effective service period × warehouse; the source has no delivery key."
+        )
         with self._connect() as connection:
             if not self._exists(connection, "ext_freight_invoice_current"):
                 frame = pd.DataFrame(columns=columns)
                 frame.attrs["unavailable_reason"] = "Run `make sync-freight` first."
+                _FreightPeriodScope(
+                    filters.start_date,
+                    filters.end_date,
+                    None,
+                    None,
+                    None,
+                    None,
+                ).attach(frame)
+                frame.attrs["ignored_filters"] = self._ignored_freight_filters(
+                    filters, lens="warehouse"
+                )
+                frame.attrs["attribution"] = attribution
                 return frame
 
+            scope = self._freight_period_scope(connection, filters)
+            if not scope.available:
+                frame = pd.DataFrame(columns=columns)
+                scope.attach(frame)
+                frame.attrs["unavailable_reason"] = scope.warning
+                frame.attrs["ignored_filters"] = self._ignored_freight_filters(
+                    filters, lens="warehouse"
+                )
+                frame.attrs["attribution"] = attribution
+                return frame
+            effective_filters = scope.effective_filters(filters)
+
             freight_where, freight_parameters = self._shared_freight_filters(
-                filters,
+                effective_filters,
                 date_column="invoice.service_date",
                 warehouse_alias="warehouse",
                 route_column="invoice.route_code",
                 include_route=False,
             )
             delivery_where, delivery_parameters = self._shared_freight_filters(
-                filters,
+                effective_filters,
                 date_column="service.delivery_date",
                 warehouse_alias="warehouse",
                 route_column="service.route_code",
@@ -254,13 +446,11 @@ class ExternalAnalyticsService:
                 """,
                 [*freight_parameters, *delivery_parameters],
             ).fetchdf()
+        scope.attach(frame)
         frame.attrs["ignored_filters"] = self._ignored_freight_filters(
             filters, lens="warehouse"
         )
-        frame.attrs["attribution"] = (
-            "Invoice numerator and delivered-case denominator are independently aggregated at "
-            "service period × warehouse; the source has no delivery key."
-        )
+        frame.attrs["attribution"] = attribution
         return frame
 
     def freight_by_carrier(self, filters: FilterSet) -> pd.DataFrame:
@@ -275,14 +465,43 @@ class ExternalAnalyticsService:
             "pending_cost_inr",
             "disputed_cost_inr",
         ]
+        attribution = (
+            "Carrier invoice spend is valid; cost per case by carrier is unavailable because "
+            "operational deliveries contain no carrier key."
+        )
+        route_lens = bool(filters.route_codes)
         with self._connect() as connection:
             if not self._exists(connection, "ext_freight_invoice_current"):
                 frame = pd.DataFrame(columns=columns)
                 frame.attrs["unavailable_reason"] = "Run `make sync-freight` first."
+                _FreightPeriodScope(
+                    filters.start_date,
+                    filters.end_date,
+                    None,
+                    None,
+                    None,
+                    None,
+                ).attach(frame)
+                frame.attrs["ignored_filters"] = self._ignored_freight_filters(
+                    filters,
+                    lens="carrier_route" if route_lens else "carrier_warehouse",
+                )
+                frame.attrs["attribution"] = attribution
                 return frame
-            route_lens = bool(filters.route_codes)
+            scope = self._freight_period_scope(connection, filters)
+            if not scope.available:
+                frame = pd.DataFrame(columns=columns)
+                scope.attach(frame)
+                frame.attrs["unavailable_reason"] = scope.warning
+                frame.attrs["ignored_filters"] = self._ignored_freight_filters(
+                    filters,
+                    lens="carrier_route" if route_lens else "carrier_warehouse",
+                )
+                frame.attrs["attribution"] = attribution
+                return frame
+            effective_filters = scope.effective_filters(filters)
             where, parameters = self._shared_freight_filters(
-                filters,
+                effective_filters,
                 date_column="invoice.service_date",
                 warehouse_alias="warehouse",
                 route_column="invoice.route_code",
@@ -308,14 +527,12 @@ class ExternalAnalyticsService:
                 """,
                 parameters,
             ).fetchdf()
+        scope.attach(frame)
         frame.attrs["ignored_filters"] = self._ignored_freight_filters(
             filters,
             lens="carrier_route" if route_lens else "carrier_warehouse",
         )
-        frame.attrs["attribution"] = (
-            "Carrier invoice spend is valid; cost per case by carrier is unavailable because "
-            "operational deliveries contain no carrier key."
-        )
+        frame.attrs["attribution"] = attribution
         return frame
 
     def freight_by_route(self, filters: FilterSet) -> pd.DataFrame:
@@ -335,20 +552,47 @@ class ExternalAnalyticsService:
             "settled_freight_cost_per_delivered_case_inr",
             "freight_cost_per_delivered_case_inr",
         ]
+        attribution = (
+            "Invoice numerator and delivered-case denominator are independently aggregated at "
+            "effective service period × route; no invoice-to-delivery linkage is claimed."
+        )
         with self._connect() as connection:
             if not self._exists(connection, "ext_freight_invoice_current"):
                 frame = pd.DataFrame(columns=columns)
                 frame.attrs["unavailable_reason"] = "Run `make sync-freight` first."
+                _FreightPeriodScope(
+                    filters.start_date,
+                    filters.end_date,
+                    None,
+                    None,
+                    None,
+                    None,
+                ).attach(frame)
+                frame.attrs["ignored_filters"] = self._ignored_freight_filters(
+                    filters, lens="route"
+                )
+                frame.attrs["attribution"] = attribution
                 return frame
+            scope = self._freight_period_scope(connection, filters)
+            if not scope.available:
+                frame = pd.DataFrame(columns=columns)
+                scope.attach(frame)
+                frame.attrs["unavailable_reason"] = scope.warning
+                frame.attrs["ignored_filters"] = self._ignored_freight_filters(
+                    filters, lens="route"
+                )
+                frame.attrs["attribution"] = attribution
+                return frame
+            effective_filters = scope.effective_filters(filters)
             freight_where, freight_parameters = self._shared_freight_filters(
-                filters,
+                effective_filters,
                 date_column="invoice.service_date",
                 warehouse_alias="warehouse",
                 route_column="invoice.route_code",
                 include_warehouse=False,
             )
             delivery_where, delivery_parameters = self._shared_freight_filters(
-                filters,
+                effective_filters,
                 date_column="service.delivery_date",
                 warehouse_alias="warehouse",
                 route_column="service.route_code",
@@ -409,13 +653,11 @@ class ExternalAnalyticsService:
                 """,
                 [*freight_parameters, *delivery_parameters],
             ).fetchdf()
+        scope.attach(frame)
         frame.attrs["ignored_filters"] = self._ignored_freight_filters(
             filters, lens="route"
         )
-        frame.attrs["attribution"] = (
-            "Invoice numerator and delivered-case denominator are independently aggregated at "
-            "service period × route; no invoice-to-delivery linkage is claimed."
-        )
+        frame.attrs["attribution"] = attribution
         return frame
 
     def freight_route_performance(
@@ -435,14 +677,9 @@ class ExternalAnalyticsService:
             raise ValueError("ranking must be best, most_improved, or worst")
         if limit <= 0 or limit > 100:
             raise ValueError("limit must be between 1 and 100")
-        period_days = (filters.end_date - filters.start_date).days + 1
-        if period_days <= 0:
+        requested_period_days = (filters.end_date - filters.start_date).days + 1
+        if requested_period_days <= 0:
             raise ValueError("filters.end_date must be on or after filters.start_date")
-        prior_end = filters.start_date - timedelta(days=1)
-        prior_start = prior_end - timedelta(days=period_days - 1)
-        prior_filters = replace(filters, start_date=prior_start, end_date=prior_end)
-        current = self.freight_by_route(filters)
-        prior = self.freight_by_route(prior_filters)
         columns = [
             "route_code",
             "route_name",
@@ -457,6 +694,51 @@ class ExternalAnalyticsService:
             "cost_per_case_delta_inr",
             "cost_per_case_delta_pct",
         ]
+        current = self.freight_by_route(filters)
+        effective_period = current.attrs.get("effective_period")
+        if not (
+            isinstance(effective_period, tuple)
+            and len(effective_period) == 2
+            and isinstance(effective_period[0], date)
+            and isinstance(effective_period[1], date)
+        ):
+            frame = pd.DataFrame(columns=columns)
+            frame.attrs["unavailable_reason"] = current.attrs.get(
+                "unavailable_reason",
+                "No effective freight period is available for route comparison.",
+            )
+            self._attach_freight_route_performance_attrs(
+                frame,
+                filters=filters,
+                current=current,
+                prior=None,
+                prior_period=None,
+                ranking=ranking,
+            )
+            return frame
+
+        current_start, current_end = effective_period
+        effective_period_days = (current_end - current_start).days + 1
+        prior_end = current_start - timedelta(days=1)
+        prior_start = prior_end - timedelta(days=effective_period_days - 1)
+        prior_period = (prior_start, prior_end)
+        prior_filters = replace(filters, start_date=prior_start, end_date=prior_end)
+        prior = self.freight_by_route(prior_filters)
+        if prior.attrs.get("coverage_clamped", False):
+            frame = pd.DataFrame(columns=columns)
+            frame.attrs["unavailable_reason"] = (
+                "An equal-length prior freight comparison is unavailable because the observed "
+                "invoice service-date coverage does not contain the complete prior window."
+            )
+            self._attach_freight_route_performance_attrs(
+                frame,
+                filters=filters,
+                current=current,
+                prior=prior,
+                prior_period=prior_period,
+                ranking=ranking,
+            )
+            return frame
         if current.empty or prior.empty:
             frame = pd.DataFrame(columns=columns)
             frame.attrs["unavailable_reason"] = current.attrs.get(
@@ -465,6 +747,14 @@ class ExternalAnalyticsService:
                     "unavailable_reason",
                     "No route has evidence in both equivalent periods.",
                 ),
+            )
+            self._attach_freight_route_performance_attrs(
+                frame,
+                filters=filters,
+                current=current,
+                prior=prior,
+                prior_period=prior_period,
+                ranking=ranking,
             )
             return frame
         current_fields = current[
@@ -528,16 +818,13 @@ class ExternalAnalyticsService:
             [order_column, "route_code"], ascending=[ascending, True], na_position="last"
         ).head(limit)
         frame = frame[columns].reset_index(drop=True)
-        frame.attrs["ranking"] = ranking
-        frame.attrs["current_period"] = (filters.start_date, filters.end_date)
-        frame.attrs["prior_period"] = (prior_start, prior_end)
-        frame.attrs["ignored_filters"] = self._ignored_freight_filters(
-            filters, lens="route"
-        )
-        frame.attrs["attribution"] = (
-            "Current and prior invoice numerators and delivery denominators are independently "
-            "aggregated at period × route. Lower cost/case is better; no carrier attribution "
-            "or causal claim is made."
+        self._attach_freight_route_performance_attrs(
+            frame,
+            filters=filters,
+            current=current,
+            prior=prior,
+            prior_period=prior_period,
+            ranking=ranking,
         )
         return frame
 

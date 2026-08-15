@@ -103,6 +103,8 @@ COLD_CHAIN_DIMENSIONS: dict[str, tuple[str, str]] = {
     "month": ("date_trunc('month', delivery_date)::DATE", "Delivery month"),
 }
 
+RANKED_COLD_CHAIN_MIN_DELIVERIES = 25
+
 _DATE_RANGE_SOURCES: dict[str, tuple[str, str]] = {
     "requested_delivery": ("fct_order_service", "requested_delivery_date"),
     "actual_delivery": ("fct_delivery", "delivery_date"),
@@ -203,6 +205,38 @@ class AnalyticsService:
         with self._connect() as connection:
             minimum, maximum = connection.execute(
                 f"SELECT min({date_column}), max({date_column}) FROM {table}"
+            ).fetchone()
+        return minimum, maximum
+
+    def available_reporting_date_range(self) -> tuple[date, date]:
+        """Return the union span of every available date-filtered metric fact."""
+
+        with self._connect() as connection:
+            date_sources = [
+                "SELECT requested_delivery_date AS metric_date FROM fct_order_service",
+                "SELECT delivery_date AS metric_date FROM fct_delivery",
+                "SELECT return_date AS metric_date FROM fct_return_credit_note",
+                "SELECT snapshot_date AS metric_date FROM fct_inventory_snapshot",
+            ]
+            freight_available = connection.execute(
+                """
+                SELECT count(*) > 0
+                FROM information_schema.tables
+                WHERE table_name = 'ext_freight_invoice_current'
+                  AND table_schema = current_schema()
+                """
+            ).fetchone()[0]
+            if freight_available:
+                date_sources.append(
+                    "SELECT service_date AS metric_date FROM ext_freight_invoice_current"
+                )
+            union_sql = " UNION ALL ".join(date_sources)
+            minimum, maximum = connection.execute(
+                f"""
+                SELECT min(metric_date), max(metric_date)
+                FROM ({union_sql}) governed_dates
+                WHERE metric_date IS NOT NULL
+                """
             ).fetchone()
         return minimum, maximum
 
@@ -1072,11 +1106,17 @@ class AnalyticsService:
             return connection.execute(sql, parameters).fetchdf()
 
     def shortage_contributors(
-        self, filters: FilterSet, dimension: str, *, limit: int = 20
+        self,
+        filters: FilterSet,
+        dimension: str,
+        basis: QuantityBasis = QuantityBasis.EACHES,
+        *,
+        limit: int = 20,
     ) -> pd.DataFrame:
         if dimension not in LINE_DIMENSIONS:
             raise ValueError(f"Unsupported shortage dimension: {dimension}")
         column, label = LINE_DIMENSIONS[dimension]
+        suffix = "eaches" if basis == QuantityBasis.EACHES else "case_equivalents"
         where, parameters = self._filter_sql(
             filters, date_column="requested_delivery_date"
         )
@@ -1090,14 +1130,15 @@ class AnalyticsService:
                        AS short_delivery_value_exposure_inr,
                    sum(estimated_dispatch_value_inr) AS estimated_dispatch_value_inr
             FROM fct_order_line
-            WHERE is_eligible_service AND short_eaches > 0 AND {where}
+            WHERE is_eligible_service AND short_{suffix} > 0 AND {where}
             GROUP BY {column}
-            ORDER BY short_eaches DESC
+            ORDER BY short_{suffix} DESC, dimension_value
             LIMIT ?
         """
         with self._connect() as connection:
             frame = connection.execute(sql, parameters).fetchdf()
         frame.attrs["dimension_label"] = label
+        frame.attrs["quantity_basis"] = basis.value
         return frame
 
     def short_delivery_exposure(
@@ -1159,17 +1200,24 @@ class AnalyticsService:
         return frame
 
     def cold_chain_by_dimension(
-        self, filters: FilterSet, dimension: str, *, limit: int = 20
+        self,
+        filters: FilterSet,
+        dimension: str,
+        *,
+        min_chilled_deliveries: int = 1,
+        limit: int = 20,
     ) -> pd.DataFrame:
         """Aggregate source-flagged excursions with descriptive peak-temperature evidence."""
 
         if dimension not in COLD_CHAIN_DIMENSIONS:
             raise ValueError(f"Unsupported cold-chain dimension: {dimension}")
+        if min_chilled_deliveries < 1:
+            raise ValueError("min_chilled_deliveries must be positive")
         if limit < 1:
             raise ValueError("limit must be positive")
         column, label = COLD_CHAIN_DIMENSIONS[dimension]
         where, parameters = self._filter_sql(filters, date_column="delivery_date")
-        parameters.append(limit)
+        parameters.extend([min_chilled_deliveries, limit])
         relation = "fct_delivery"
         grain = "One delivery"
         non_additive_warning = ""
@@ -1228,6 +1276,7 @@ class AnalyticsService:
             WHERE is_eligible_service AND has_chilled_product
               AND {column} IS NOT NULL AND {where}
             GROUP BY {column}
+            HAVING count(*) >= ?
             ORDER BY excursions_per_100 DESC, excursions DESC,
                      peak_excursion_max_temp_c DESC NULLS LAST, dimension_value
             LIMIT ?
@@ -1238,6 +1287,7 @@ class AnalyticsService:
             {
                 "dimension_label": label,
                 "grain": grain,
+                "min_chilled_deliveries": min_chilled_deliveries,
                 "severity_definition": (
                     "The <=8C, >8-12C, and >12C bands describe recorded peak "
                     "temperature among source-flagged deliveries only. They are not validated "
@@ -1251,7 +1301,12 @@ class AnalyticsService:
     def cold_chain_trend(self, filters: FilterSet) -> pd.DataFrame:
         """Return the same governed excursion evidence at delivery-month grain."""
 
-        frame = self.cold_chain_by_dimension(filters, "month", limit=120)
+        frame = self.cold_chain_by_dimension(
+            filters,
+            "month",
+            min_chilled_deliveries=1,
+            limit=120,
+        )
         frame.attrs["date_basis"] = "Actual delivery month"
         return frame.sort_values("dimension_value").reset_index(drop=True)
 
@@ -1374,7 +1429,8 @@ class AnalyticsService:
                            {self.near_expiry_days}) AS near_expiry_flag,
                        (available_cases > 0 AND expiry_days < 0) AS expired_stock_flag,
                        (damaged_cases > 0) AS damaged_stock_flag,
-                       (blocked_cases > 0) AS blocked_stock_flag
+                       (blocked_cases > 0) AS blocked_stock_flag,
+                       count(*) OVER () AS _total_matching_rows
                 FROM fct_inventory_snapshot
                 WHERE {' AND '.join(conditions)}
                 ORDER BY expired_stock_flag DESC, near_expiry_flag DESC,
@@ -1384,6 +1440,14 @@ class AnalyticsService:
                 """,
                 parameters,
             ).fetchdf()
+
+        total_matching_rows = (
+            int(frame["_total_matching_rows"].iloc[0])
+            if not frame.empty
+            else 0
+        )
+        if "_total_matching_rows" in frame:
+            frame = frame.drop(columns="_total_matching_rows")
 
         ignored_filters: list[str] = []
         for label, values in (
@@ -1402,6 +1466,8 @@ class AnalyticsService:
                 "grain": "One warehouse × SKU × batch × weekly source snapshot row",
                 "risk_only": risk_only,
                 "near_expiry_days": self.near_expiry_days,
+                "total_matching_rows": total_matching_rows,
+                "row_limit": limit,
                 "ignored_filters": tuple(ignored_filters),
             }
         )
@@ -1452,6 +1518,35 @@ class AnalyticsService:
         """
         with self._connect() as connection:
             return connection.execute(sql, parameters).fetchdf()
+
+    def cold_chain_return_summary(self, filters: FilterSet) -> MetricValue:
+        """Aggregate approved cold-chain credits independently of evidence row limits."""
+
+        where, parameters = self._filter_sql(filters, date_column="return_date")
+        sql = f"""
+            SELECT coalesce(
+                       sum(credit_note_value_inr)
+                           FILTER (WHERE credit_note_status = 'APPROVED'),
+                       0
+                   ) AS approved_value_inr,
+                   count(*) FILTER (
+                       WHERE credit_note_status = 'APPROVED'
+                   ) AS approved_lines
+            FROM fct_return_credit_note
+            WHERE is_cold_chain_return AND {where}
+        """
+        with self._connect() as connection:
+            approved_value, approved_lines = connection.execute(
+                sql, parameters
+            ).fetchone()
+        return MetricValue(
+            "approved_credit_note_value_inr",
+            self._number(approved_value),
+            self._number(approved_value),
+            None,
+            "INR",
+            int(approved_lines or 0),
+        )
 
     def return_disposition_summary(
         self,
@@ -1531,7 +1626,8 @@ class AnalyticsService:
                    return_qty_normalized, return_sign_was_negative,
                    return_eaches, return_case_equivalents,
                    return_reason_code, credit_note_status,
-                   credit_note_value_inr, disposition
+                   credit_note_value_inr, disposition,
+                   count(*) OVER () AS _total_matching_rows
             FROM fct_return_credit_note
             WHERE is_cold_chain_return
               AND {where}
@@ -1542,11 +1638,20 @@ class AnalyticsService:
         """
         with self._connect() as connection:
             frame = connection.execute(sql, parameters).fetchdf()
+        total_matching_rows = (
+            int(frame["_total_matching_rows"].iloc[0])
+            if not frame.empty
+            else 0
+        )
+        if "_total_matching_rows" in frame:
+            frame = frame.drop(columns="_total_matching_rows")
         frame.attrs["grain"] = "One exact source credit-note line linked by order_line_id"
         frame.attrs["quantity_rule"] = (
             "Physical return quantity is absolute-valued and normalized through "
             "case_pack_at_order; raw sign remains visible."
         )
+        frame.attrs["total_matching_rows"] = total_matching_rows
+        frame.attrs["row_limit"] = limit
         return frame
 
     def discontinued_order_evidence(
