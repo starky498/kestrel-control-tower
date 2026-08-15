@@ -51,6 +51,14 @@ CASES = (
         DimensionKey.CUSTOMER_REGION,
     ),
     BenchmarkCase(
+        "returns_by_category_with_leading_reason",
+        "Which categories drive the largest value of returns, and what is the leading reason "
+        "code in Q1?",
+        AnswerStatus.OK,
+        MetricKey.RETURNS,
+        DimensionKey.CATEGORY,
+    ),
+    BenchmarkCase(
         "ambiguous_region_lens",
         "What was fill rate in West region last month?",
         AnswerStatus.AMBIGUOUS,

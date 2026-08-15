@@ -22,7 +22,7 @@ Status meanings:
 | Original idea | Governed implementation | Status and evidence |
 |---|---|---|
 | Map Kestrel's end-to-end value chain | Order promise → allocation → post-allocation fulfilment → delivery/POD/cold chain → returns/credits/freight, with inventory and market/context evidence | **Implemented.** Business and runtime flows are in `docs/ARCHITECTURE.md`; eight workspaces follow the same decision chain. |
-| Review every CSV and header | SQLite and all 13 CSV representations are declared through source contracts; schema, grain, primary key, foreign key, quantity, parity, and known-conflict checks run before build | **Implemented.** `src/kestrel/contracts.py`, `docs/DATA_QUALITY.md`, `make validate-data`; current pack has 93 checks. |
+| Review every CSV and header | SQLite and all 13 CSV representations are declared through source contracts; schema, grain, primary key, foreign key, quantity, expected CSV header order, CSV-versus-SQLite row counts, and known-conflict checks run before build. This is not cell-by-cell CSV equality. | **Implemented.** `src/kestrel/contracts.py`, `docs/DATA_QUALITY.md`, `make validate-data`; current pack has 93 checks. |
 | Clean and normalize data | Raw tables are retained; semantic dimensions/facts normalize UOM, order-time pack, source-specific `created_at` to IST with parse status, delivery timestamps, booleans, geography, lifecycle, promotion/source, status, return signs, and display labels | **Implemented.** `sql/10_dimensions.sql`, `sql/20_facts.sql`, source-contract tests. No source record is rewritten, and no KPI uses creation time. |
 | Build how values connect | Native relational facts and exact keys replace a fan-out graph/mega-join; fact-to-fact ratios aggregate first unless an exact key exists | **Implemented.** Grain/join table in `docs/ARCHITECTURE.md`; warehouse grain assertions and metric tests. Graph database is an explicit **boundary**. |
 | Engineer decision features | Allocation/post-allocation short, dual-basis fill, strict line/order in-full, parsed delay, promotion/source evidence, short booked-value exposure, cold severity/batches, dispositions, settled/billed freight, effective-dated market history, and context gates | **Implemented.** Semantic SQL, integration store, metric services, and 24-definition registry. |
@@ -37,7 +37,7 @@ Status meanings:
 | Plan / requirement | Implementation artifacts | Tests or operational evidence | Status |
 |---|---|---|---|
 | Read operational source without mutation (`CON-06`, `DATA-01`) | `src/kestrel/config.py`, `src/kestrel/contracts.py`, `src/kestrel/warehouse.py` | SQLite URI uses read-only mode; `make doctor`; `make validate-data` | **Implemented** |
-| Declare and validate all 13 source tables (`DATA-01`) | `CONTRACTS`, quality-result model, `docs/DATA_QUALITY.md` | 93 schema/grain/FK/parity/conflict checks on current pack | **Implemented; verified local evidence** |
+| Declare and validate all 13 source tables (`DATA-01`) | `CONTRACTS`, quality-result model, `docs/DATA_QUALITY.md` | 93 schema/grain/FK/conflict checks plus exact CSV header-order and row-count controls on the current pack | **Implemented; verified local evidence** |
 | Preserve raw and canonical values (`CON-04`, `DATA-02`) | `raw_*`, dimensions/facts, conflict flags in governed SQL | Warehouse/source contract and metric unit tests | **Implemented** |
 | Normalize mixed CASE/EACH UOM (`SVC-01`, `SVC-02`) | `fct_order_line` order-time eaches/case-equivalents | Ratio-of-sums and service tests; quantity selector | **Implemented** |
 | Separate customer and origin/DC geography (`UX-09`) | Dimensions, `FilterSet`, global filters, NLQ geography parser | Explicit customer/DC questions and ambiguity tests | **Implemented** |
@@ -136,8 +136,8 @@ than hard-coding a second page list.
 | Bounded destructive behavior (`REC-01`) | Per-target containment/symlink checks and `--yes` guard | Removes only validated DB/four caches/Parquet/log targets inside project `.kestrel`; external-file regression test | **Implemented** |
 | Non-root container (`DEP-01`) | `Dockerfile`, `compose.yaml`, entrypoint | Python 3.11, UID 10001, pinned application lock, port/health, read-only source, persisted runtime | **Implemented; Docker build is the remote CI acceptance gate** |
 | Continuous quality (`CI-01`) | `.github/workflows/ci.yml` | Read-only permission; pinned dependency install; Ruff, mypy, pytest; separate Docker build | **Implemented; live status is exposed by the README badge** |
-| UI regression/performance (`PERF-01`) | `scripts/audit_ui.py` | Eight discovered pages, heading/error/label checks, ≤15,000 ms, JSON | **Verified locally:** 8/8 passed; initial 1,334.872 ms; slowest rerender 421.756 ms (Executive Command Center) |
-| Governed-question regression/performance | `scripts/benchmark_qa.py` | Baseline finite cases plus two optional-model paraphrases verify status/intent/result limit and ≤5,000 ms with required external snapshots | **Verified locally:** 19/19 applicable cases passed with local model; slowest case 297.479 ms |
+| UI regression/performance (`PERF-01`) | `scripts/audit_ui.py` | Eight discovered pages, heading/error/label checks, ≤15,000 ms, JSON | **Verified locally:** 8/8 passed; initial 1,749.788 ms; slowest rerender 648.406 ms (Executive Command Center) |
+| Governed-question regression/performance | `scripts/benchmark_qa.py` | Baseline finite cases plus two optional-model paraphrases verify status/intent/result limit and ≤5,000 ms with required external snapshots | **Verified locally:** 20/20 applicable cases passed with local model; slowest case 379.274 ms |
 | Manual accessibility (`A11Y-01`) | `docs/ACCESSIBILITY_PERFORMANCE.md` | Keyboard/focus/contrast/zoom/screen-reader record | **Pending manual verification; no WCAG claim** |
 
 ## Documentation and interview traceability
@@ -145,7 +145,7 @@ than hard-coding a second page list.
 | Artifact | Purpose | Status |
 |---|---|---|
 | `README.md` | Outcome, eight workspaces, clean start, pinned locks, integrations, Docker, commands, trust/boundaries | **Implemented** |
-| `DECISIONS.md` | Concise approved scope, judgments, boundaries, next production steps | **Implemented; keep within one-page intent** |
+| `DECISIONS.md` | Concise approved scope, judgments, boundaries, next production steps | **Implemented; verified as one Letter page** |
 | `docs/ARCHITECTURE.md` | Business value chain, runtime, staged/coordinated publication, grains, external/reliability/deployment | **Implemented** |
 | `docs/METRICS.md` | All 24 contracts, dates, gates, context rules, evidence and version policy | **Implemented** |
 | `docs/REQUIREMENTS.md` | Hard, business, decision, quality, platform, and release acceptance | **Implemented** |
@@ -164,9 +164,9 @@ These rows prevent “implemented” from being mistaken for “release evidence
 |---|---|---|
 | Source/warehouse release | `make validate-data` and `make build`; manifest/source fingerprint reconciled | Passed locally: 93 checks, zero blocking; 818,901 raw rows; fingerprint recorded above |
 | Static quality | `make lint` and `git diff --check` | Passed locally: Ruff and mypy clean; diff check clean |
-| Full tests | `make test` | Passed locally: 239 tests |
-| Eight-page UI gate | `scripts/audit_ui.py --expected-pages 8 --threshold-ms 15000`; report `passed: true` and `page_count_passed: true` | Passed locally: 8/8; initial 1,334.872 ms; slowest 421.756 ms (Executive Command Center) |
-| Governed-question gate | `scripts/benchmark_qa.py --threshold-ms 5000`; report `passed: true` | Passed locally: 19/19 applicable cases with local model; slowest 297.479 ms |
+| Full tests | `make test` | Passed locally: complete deterministic pytest suite |
+| Eight-page UI gate | `scripts/audit_ui.py --expected-pages 8 --threshold-ms 15000`; report `passed: true` and `page_count_passed: true` | Passed locally: 8/8; initial 1,749.788 ms; slowest 648.406 ms (Executive Command Center) |
+| Governed-question gate | `scripts/benchmark_qa.py --threshold-ms 5000`; report `passed: true` | Passed locally: 20/20 applicable cases with local model; slowest 379.274 ms |
 | Manual accessibility | Completed checklist with reviewer/environment | **Pending; no WCAG claim** |
 | Container | `docker build` and/or `docker compose up --build`, health check | Docker build delegated to remote CI; local Docker unavailable |
 | Repository safety | Clean/known status; no source DB/cache/secret/generated artifact tracked | Passed local tracked-file and secret scans; recheck after final commit |

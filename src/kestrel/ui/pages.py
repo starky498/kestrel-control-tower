@@ -4002,6 +4002,7 @@ def render_ask(
         "Why did fill rate drop in the West customer region?",
         "Which five outlets had the lowest case fill rate?",
         "What was OTIF by customer region?",
+        "Which categories drive the largest return value and what is the leading reason?",
         "Which warehouses have the largest overdue backlog?",
         "Where is allocation weakest by customer region?",
         "Which routes are missing proof of delivery?",

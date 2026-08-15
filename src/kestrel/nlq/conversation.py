@@ -34,6 +34,7 @@ from kestrel.nlq.router import (
     _extract_limit,
     _extract_quantity_basis,
     _extract_ranking,
+    _requests_leading_return_reason,
     _resolve_period,
     _unsupported_request_message,
     normalize_business_spelling,
@@ -355,6 +356,27 @@ def build_follow_up_patch(
     dimensions: tuple[DimensionKey, ...] | None = detected_dimensions or None
     if re.search(r"\b(?:overall|without (?:a )?breakdown|no breakdown)\b", text):
         dimensions = ()
+    leading_return_reason = None
+    effective_metric = metric or previous_intent.metric
+    effective_dimensions = (
+        dimensions if dimensions is not None else previous_intent.dimensions
+    )
+    if (
+        (metric is not None or dimensions is not None)
+        and (
+            previous_intent.leading_return_reason
+            or (
+                effective_metric == MetricKey.RETURNS
+                and set(effective_dimensions)
+                == {DimensionKey.CATEGORY, DimensionKey.RETURN_REASON}
+            )
+        )
+    ):
+        leading_return_reason = _requests_leading_return_reason(
+            text,
+            effective_metric,
+            effective_dimensions,
+        )
 
     quantity_basis = None
     if re.search(r"\b(?:eaches|units?|cases?|case equivalents?)\b", text):
@@ -394,6 +416,7 @@ def build_follow_up_patch(
         limit=limit,
         clear_limit=clear_limit,
         explain_change=explain_change,
+        leading_return_reason=leading_return_reason,
     )
 
 
@@ -487,6 +510,7 @@ class IntentPatch:
     late_threshold_minutes: int | None = None
     rate_threshold: float | None = None
     explain_change: bool | None = None
+    leading_return_reason: bool | None = None
 
     def __post_init__(self) -> None:
         if not self.raw_question.strip():
@@ -530,6 +554,7 @@ class IntentPatch:
             "late_threshold_minutes",
             "rate_threshold",
             "explain_change",
+            "leading_return_reason",
         ):
             if getattr(self, name) is not None:
                 explicit.append(name)
@@ -657,6 +682,11 @@ class ConversationMemory:
                 if patch.explain_change is not None
                 else current.explain_change
             ),
+            leading_return_reason=(
+                patch.leading_return_reason
+                if patch.leading_return_reason is not None
+                else current.leading_return_reason
+            ),
         )
         _check_intent_invariants(resolved)
         return ConversationResolution(
@@ -689,6 +719,7 @@ def _inherited_fields(current: QuestionIntent, patch: IntentPatch) -> tuple[str,
         "late_threshold_minutes",
         "rate_threshold",
         "explain_change",
+        "leading_return_reason",
     ):
         if getattr(patch, name) is None:
             inherited.append(name)
@@ -714,6 +745,14 @@ def _check_intent_invariants(intent: QuestionIntent) -> None:
         raise ValueError("A validated late threshold must be positive.")
     if not 0 <= intent.rate_threshold <= 1:
         raise ValueError("A validated rate threshold must be between zero and one.")
+    if intent.leading_return_reason and not (
+        intent.metric == MetricKey.RETURNS
+        and len(intent.dimensions) == 2
+        and set(intent.dimensions) == {DimensionKey.CATEGORY, DimensionKey.RETURN_REASON}
+    ):
+        raise ValueError(
+            "Leading return-reason selection requires returns grouped by category and reason."
+        )
 
 
 __all__ = [

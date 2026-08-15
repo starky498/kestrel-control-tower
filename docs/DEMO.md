@@ -283,7 +283,9 @@ Narrative:
 - Every accepted question calls the same deterministic metric services as the pages and cannot
   execute unrestricted model-generated SQL or change a governed formula.
 - The late-route answer uses actual delivery date and excludes routes below 25 deliveries. The
-  return answer ranks only APPROVED value and appends PENDING/REJECTED workflow-status evidence.
+  return answer ranks categories by APPROVED credit-note value, reports the leading APPROVED reason
+  within every returned category, applies documented deterministic tie-breaks, and appends
+  PENDING/REJECTED workflow-status evidence.
 - A missing model falls back gracefully to exact rules. Unsupported, uncertain-semantic,
   multi-metric, contradictory-basis, or ambiguous-geography questions fail safely and offer
   guidance.

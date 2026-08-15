@@ -77,14 +77,15 @@ a failure green; a threshold change is a requirement change and must be document
 | Visible heading | Every workspace | Passed: exact heading on all eight |
 | Streamlit exception/error | None | Passed: none reported |
 | Unlabelled interactive control | None | Passed: none reported |
-| Per-workspace render | ≤15,000 ms | Passed: slowest rerender 421.756 ms (Executive Command Center) |
+| Per-workspace render | ≤15,000 ms | Passed: slowest rerender 648.406 ms (Executive Command Center) |
 
-Evidence was recorded on 15 August 2026 against the final local release working tree after all 239
-tests passed, with the full operational warehouse plus freight, market, weather, and holiday
-snapshots. Initial render was 1,334.872 ms; the eight-workspace audit passed 8/8 and the separate
-governed-question benchmark passed 19/19 applicable cases with a slowest case of 297.479 ms. The ignored report path is
-`.kestrel/ui-audit.json`. A real Chrome visual check also found
-no horizontal document overflow at a 390 × 844 viewport. Keyboard-only operation, 200% zoom,
+Evidence was recorded on 16 August 2026 against the current local release working tree after the
+complete deterministic test suite passed, with the full operational warehouse plus freight,
+market, weather, and holiday snapshots. Initial render was 1,749.788 ms; the eight-workspace audit
+passed 8/8 and the separate governed-question benchmark passed 20/20 applicable cases with a
+slowest case of 379.274 ms. The ignored report path is `.kestrel/ui-audit.json`. A real Chrome
+visual check also found no horizontal document overflow at a 390 × 844 viewport. Keyboard-only
+operation, 200% zoom,
 contrast measurement, and screen-reader testing remain pending; no WCAG claim is made.
 
 ## Manual accessibility checklist

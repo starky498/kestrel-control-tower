@@ -422,6 +422,35 @@ class FakeMetricService:
             }
         ).head(limit)
 
+    def returns_by_category_with_leading_reason(
+        self,
+        filters: FilterSet,
+        *,
+        statuses: tuple[str, ...] = ("APPROVED",),
+        limit: int = 20,
+    ) -> pd.DataFrame:
+        self.calls.append(
+            (
+                "returns_by_category_with_leading_reason",
+                (filters, statuses, limit),
+            )
+        )
+        return pd.DataFrame(
+            {
+                "category": ["Snacks", "Dairy"],
+                "credit_note_lines": [2, 5],
+                "return_eaches": [20.0, 50.0],
+                "return_case_equivalents": [2.0, 5.0],
+                "credit_note_value_inr": [3500.0, 12500.0],
+                "leading_reason_code": ["RT07", "RT06"],
+                "leading_reason_credit_note_lines": [2, 3],
+                "leading_reason_return_eaches": [20.0, 30.0],
+                "leading_reason_return_case_equivalents": [2.0, 3.0],
+                "leading_reason_credit_note_value_inr": [3500.0, 7500.0],
+                "leading_reason_share_of_category_value": [1.0, 0.6],
+            }
+        ).head(limit)
+
     def credit_status_summary(self, filters: FilterSet) -> pd.DataFrame:
         self.calls.append(("credit_status_summary", filters))
         return pd.DataFrame(
@@ -617,7 +646,7 @@ def test_otif_by_customer_region_uses_latest_complete_fiscal_quarter() -> None:
     assert "strict_otif_rate" in answer.evidence[0].columns
 
 
-def test_return_question_rejects_multiple_groupings_without_running_a_query() -> None:
+def test_return_question_answers_category_ranking_with_leading_reason() -> None:
     router, service = _router()
 
     answer = router.answer(
@@ -625,9 +654,89 @@ def test_return_question_rejects_multiple_groupings_without_running_a_query() ->
         "reason code in Q1?"
     )
 
+    assert answer.status == AnswerStatus.OK
+    assert answer.intent is not None
+    assert answer.intent.dimensions == (
+        DimensionKey.CATEGORY,
+        DimensionKey.RETURN_REASON,
+    )
+    assert answer.intent.leading_return_reason
+    assert "return reason selection=leading per category" in answer.interpretation
+    assert "Dairy has the highest approved return value" in answer.summary
+    assert "leading reason code is RT06" in answer.summary
+    assert answer.evidence[0].title == (
+        "Approved return value by category with leading reason"
+    )
+    assert answer.evidence[0].rows[0][0] == "Dairy"
+    assert answer.evidence[0].rows[0][5] == "RT06"
+    assert answer.evidence[1].title == "Credit-note workflow status"
+    assert "Only APPROVED" in answer.warnings[0]
+    assert "PENDING and REJECTED" in answer.warnings[0]
+    assert not any(call[0] == "returns_by_dimension" for call in service.calls)
+    composite_calls = [
+        call for call in service.calls if call[0] == "returns_by_category_with_leading_reason"
+    ]
+    assert len(composite_calls) == 1
+    assert composite_calls[0][1][1] == ("APPROVED",)
+
+
+@pytest.mark.parametrize(
+    "reason_phrase",
+    ("leading reason code", "top return reason", "main reason code"),
+)
+def test_return_category_reason_mode_requires_an_explicit_leading_phrase(
+    reason_phrase: str,
+) -> None:
+    router, _ = _router()
+
+    parsed = router.parse(
+        f"Show the largest returns by category and {reason_phrase} in Q1"
+    )
+
+    assert parsed.status == ParseStatus.READY
+    assert parsed.intent is not None
+    assert parsed.intent.dimensions == (
+        DimensionKey.CATEGORY,
+        DimensionKey.RETURN_REASON,
+    )
+    assert parsed.intent.leading_return_reason
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "Show returns by category and reason code in Q1",
+        "Show the top five returns by category and reason code in Q1",
+    ),
+)
+def test_generic_return_category_reason_grouping_stays_ambiguous_without_query(
+    question: str,
+) -> None:
+    router, service = _router()
+
+    answer = router.answer(question)
+
     assert answer.status == AnswerStatus.AMBIGUOUS
     assert "one grouping dimension" in answer.summary
-    assert not any(call[0] == "returns_by_dimension" for call in service.calls)
+    assert not any(
+        call[0]
+        in {"returns_by_dimension", "returns_by_category_with_leading_reason"}
+        for call in service.calls
+    )
+
+
+def test_unrelated_return_multi_grouping_still_fails_without_query() -> None:
+    router, service = _router()
+
+    answer = router.answer("Show returns by warehouse and reason code in Q1")
+
+    assert answer.status == AnswerStatus.AMBIGUOUS
+    assert "one grouping dimension" in answer.summary
+    assert not any(
+        call[0]
+        in {"returns_by_dimension", "returns_by_category_with_leading_reason"}
+        for call in service.calls
+    )
 
 
 def test_chilled_excursions_by_month_calls_summary_for_each_q1_month() -> None:
