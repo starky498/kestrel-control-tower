@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pytest
@@ -158,7 +159,9 @@ def test_complete_freight_snapshot_preserves_source_and_converted_units(
         Decimal("2.50"),
         Decimal("125.95"),
     )
-    assert row[4].isoformat().startswith("2026-06-16T01:45:00")
+    assert row[4].astimezone(ZoneInfo("Asia/Kolkata")).isoformat() == (
+        "2026-06-16T01:45:00+05:30"
+    )
     assert sync_rows == 1
 
 
