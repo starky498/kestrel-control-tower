@@ -606,7 +606,8 @@ def validate_csv_parity(csv_dir: Path, db_path: Path) -> list[QualityResult]:
                 True,
                 "not supplied",
                 "optional",
-                "CSV parity was skipped because the optional CSV directory is absent.",
+                "CSV header and row-count validation was skipped because the optional CSV "
+                "directory is absent.",
             )
         ]
 

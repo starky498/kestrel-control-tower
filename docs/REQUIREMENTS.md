@@ -17,7 +17,7 @@ Requirement classes:
 - **Quality** — needed for a trustworthy, reproducible, and defensible implementation.
 
 Implementation evidence is mapped in `docs/FULL_SCOPE_TRACEABILITY.md`. The current local
-eight-workspace and governed-question release gates passed on 15 August 2026; generated reports are
+eight-workspace and governed-question release gates passed on 16 August 2026; generated reports are
 ignored and must be refreshed for a materially changed commit or data snapshot. Manual
 accessibility remains separate and is not implied by the automated result.
 
@@ -41,7 +41,7 @@ accessibility remains separate and is not implied by the automated result.
 | CON-01 | Hard | Use only the supplied synthetic Kestrel/BazaarPulse data and permitted public context. | No real-client dataset or production credential is present. |
 | CON-02 | Hard | Scrape no site other than the supplied BazaarPulse experience. | Local mode reads the bundled site; HTTP mode is constrained to configured BazaarPulse listing pages. |
 | CON-03 | Quality | Treat BazaarPulse `robots.txt` as binding on a live site. | `/internal/` and `/admin/` are never requested; allowed HTTP traversal observes the crawl interval. |
-| CON-04 | Quality | Treat documentation as partial and profile the data before deciding formulas. | Known conflicts, grains, counts, parity, and assumptions are recorded and checked. |
+| CON-04 | Quality | Treat documentation as partial and profile the data before deciding formulas. | Known conflicts, grains, counts, expected CSV header order, CSV-versus-SQLite row counts, and assumptions are recorded and checked; cell-by-cell CSV equality is not claimed. |
 | CON-05 | Decision | Weather, holidays, freight, competitor refreshes, and optional language-model installation must not become hidden startup dependencies. | The core operational app opens from its warehouse without contacting an external endpoint or downloading a model. |
 | CON-06 | Quality | Do not silently mutate supplied source values. | SQLite opens read-only; raw and normalized fields coexist; conflicts remain visible. |
 | CON-07 | Quality | Keep secrets and generated evidence outside Git. | `.env`, databases, Parquet, `.kestrel/`, logs, caches, and audit artifacts are ignored. |
@@ -107,7 +107,7 @@ accessibility remains separate and is not implied by the automated result.
 
 | ID | Class | Governed requirement | Acceptance criteria |
 |---|---|---|---|
-| DATA-01 | Quality | Validate source contracts before publication. | All 13 schemas, grains, relationships, quantities, parity, and known conflicts execute; blocking failure stops a build. |
+| DATA-01 | Quality | Validate source contracts before publication. | All 13 schemas, grains, relationships, quantities, expected CSV header order, CSV-versus-SQLite row counts, and known conflicts execute; blocking failure stops a build. |
 | DATA-02 | Quality | Model facts at native grain and prevent fan-out. | Order line, order service, delivery, return, inventory batch, freight, listing/scrape/source-price history, weather, and holiday grains are documented; facts aggregate before cross-fact ratios unless an exact source key exists. |
 | DATA-03 | Quality | Publish DuckDB and portable Parquet coherently. | Unique staged DB/directory, ZSTD exports, manifest schema/source SHA-256/completion/table counts, coordinated promotion, and handled-failure rollback avoid partial artifacts; fingerprint comparison detects a hard interruption between the two replacements. |
 | DATA-04 | Quality | Preserve external evidence across operational rebuilds. | Physical `external_sync_runs`/`ext_*` data and compatible external views are copied into staging; a physical-copy error aborts promotion. |
@@ -129,7 +129,7 @@ accessibility remains separate and is not implied by the automated result.
 | Source | Role | Native grain and alignment | Reliability contract |
 |---|---|---|---|
 | `data/source/data/kestrel_ops.db` | Authoritative operational source | 13 tables, 818,901 rows. Exact source surrogate keys; historical order assignments come from orders. | Open read-only, fingerprint, validate, stream, reconcile, and never edit. |
-| `data/source/data/csv/*.csv` | Alternate representation of the same data | Same 13 logical tables; not an additional fact source. | Validate parity; never double-load SQLite and CSV copies. |
+| `data/source/data/csv/*.csv` | Alternate representation of the same data | Same 13 logical tables; not an additional fact source. | Validate contracted header order and SQLite row-count parity; do not claim cell-by-cell equality or double-load SQLite and CSV copies. |
 | Partner freight API | Actual carrier invoices | Invoice; period × DC or route only. No order/delivery key. | Authenticate locally, complete cursor, retry, checkpoint/resume, validate, atomically cache/publish, expose coverage and freshness. |
 | BazaarPulse | Current shelf cards and source-dated detail observations | Listing/retailer and listing × observed date. Kestrel SKU only through governed match. | Allowed listing/detail paths only, crawl delay in HTTP mode, structured parser warnings, complete current cache, append-only source history, quarantine ambiguity, accountable override. |
 | Open-Meteo | Optional weather context | Warehouse-city centroid × date. | Complete all warehouse-days, isolated atomic cache, freshness/coverage/join/cohort gate. |
@@ -144,7 +144,7 @@ than hard-coded answers.
 |---|---|---|
 | Q-01 | Which outlets had the lowest case fill last month? | Month resolver, eligible outlets, case-equivalent ratio of sums with a per-line delivered cap, bottom-N, ordered/delivered denominators. |
 | Q-02 | What was OTIF by region last complete quarter? | Explicit customer/DC geography, quarter label, order-grain strict OTIF, zero result and short-delivery explanation. |
-| Q-03 | Which categories drive approved return value? | Return-date filter, APPROVED headline, category/reason ranking, pending/rejected evidence, no raw signed-quantity sum. |
+| Q-03 | Which categories drive the largest return value, and what is each category's leading reason? | Return-date filter, APPROVED category ranking, deterministic leading reason within category, pending/rejected evidence, no raw signed-quantity sum. |
 | Q-04 | Excursions per hundred chilled deliveries by month? | Actual delivery month, chilled bridge, distinct-delivery numerator/denominator. |
 | Q-05 | Which routes are over two hours late on more than one in ten? | Parsed delay >120 minutes, actual-date cohort, route denominator, >10% threshold, and minimum 25 actual-date deliveries. |
 | Q-06 | How do top-value SKUs compare with Mumbai competitor prices? | Eligible dispatch ranking, current/effective-dated MRP, retailer/listing evidence, latest/source-dated final matches, pack comparability, 100G/100ML values, and unmatched coverage. |
@@ -184,8 +184,8 @@ The implementation is ready for submission only when all of the following eviden
    remain outside Git.
 
 The command for item 6 uses `--expected-pages 8` and is documented in
-`docs/ACCESSIBILITY_PERFORMANCE.md`. The 15 August 2026 local release run passed exactly eight
+`docs/ACCESSIBILITY_PERFORMANCE.md`. The 16 August 2026 local release run passed exactly eight
 workspaces with the required headings, no reported errors/exceptions or unlabelled controls, and a
-slowest page rerender of 421.756 ms on Executive Command Center against the 15,000 ms gate. This
+slowest page rerender of 648.406 ms on Executive Command Center against the 15,000 ms gate. This
 is automated regression evidence, not WCAG conformance or a substitute for the manual checks in
 that document.

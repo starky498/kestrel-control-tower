@@ -123,14 +123,14 @@ def _build_metric_fixture(path: Path) -> None:
         SELECT * FROM (VALUES
             (1, DATE '2026-04-20', 'West', 'West', 'WH01', 'RT0001', 'OUT001', 'GT',
              'APPROVED', 50.0, 'CN-1', 101, 1001, 'Outlet One', 'SKU-1',
-             'Chilled Product', 'EACH', -2.0, 2.0, TRUE, 2.0, 0.2,
+             'Chilled Product', 'Dairy', 'EACH', -2.0, 2.0, TRUE, 2.0, 0.2,
              'RT06_COLD_CHAIN_BREACH', TRUE, 'SCRAP', 'SFA_MOBILE', 'PRM0001',
              'Spring promotion', 'PERCENT_OFF', TRUE)
         ) t(
             return_id, return_date, customer_region_name, warehouse_region_name,
             warehouse_code, route_code, outlet_code, channel, credit_note_status,
             credit_note_value_inr, credit_note_number, order_id, order_line_id,
-            outlet_name, sku_code, product_name, qty_uom, return_qty_raw,
+            outlet_name, sku_code, product_name, category, qty_uom, return_qty_raw,
             return_qty_normalized, return_sign_was_negative, return_eaches,
             return_case_equivalents, return_reason_code, is_cold_chain_return,
             disposition, source_system, promotion_code, promotion_name,
@@ -648,6 +648,174 @@ def test_return_disposition_keeps_restock_scrap_and_vendor_recovery_semantics(
     assert "not proof of cash receipt" in frame.attrs["warning"]
 
 
+def test_return_category_leading_reason_uses_approved_value_and_deterministic_ties(
+    service: AnalyticsService,
+) -> None:
+    filters = FilterSet(date(2026, 4, 1), date(2026, 4, 30))
+    with duckdb.connect(str(service.database_path)) as connection:
+        connection.execute(
+            """
+            INSERT INTO fct_return_credit_note
+            SELECT * REPLACE (
+                2 AS return_id,
+                25.0 AS credit_note_value_inr,
+                'CN-2' AS credit_note_number,
+                'RT07_TRANSIT_DAMAGE' AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            UNION ALL
+            SELECT * REPLACE (
+                3 AS return_id,
+                25.0 AS credit_note_value_inr,
+                'CN-3' AS credit_note_number,
+                'RT07_TRANSIT_DAMAGE' AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            UNION ALL
+            SELECT * REPLACE (
+                4 AS return_id,
+                34.0 AS credit_note_value_inr,
+                'CN-4' AS credit_note_number,
+                'Frozen' AS category,
+                'RT08_PACK_DAMAGE' AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            UNION ALL
+            SELECT * REPLACE (
+                5 AS return_id,
+                33.0 AS credit_note_value_inr,
+                'CN-5' AS credit_note_number,
+                'Frozen' AS category,
+                'RT08_PACK_DAMAGE' AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            UNION ALL
+            SELECT * REPLACE (
+                6 AS return_id,
+                33.0 AS credit_note_value_inr,
+                'CN-6' AS credit_note_number,
+                'Frozen' AS category,
+                'RT08_PACK_DAMAGE' AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            UNION ALL
+            SELECT * REPLACE (
+                7 AS return_id,
+                45.0 AS credit_note_value_inr,
+                'CN-7' AS credit_note_number,
+                'Snacks' AS category,
+                'RT09_EXPIRED' AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            UNION ALL
+            SELECT * REPLACE (
+                8 AS return_id,
+                'PENDING' AS credit_note_status,
+                90.0 AS credit_note_value_inr,
+                'CN-8' AS credit_note_number,
+                'RT99_PENDING_REVIEW' AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            UNION ALL
+            SELECT * REPLACE (
+                9 AS return_id,
+                45.0 AS credit_note_value_inr,
+                'CN-9' AS credit_note_number,
+                'Snacks' AS category,
+                'RT10_WRONG_ITEM' AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            """
+        )
+
+    frame = service.returns_by_category_with_leading_reason(
+        filters,
+        statuses=("APPROVED",),
+        limit=3,
+    )
+
+    assert frame["category"].tolist() == ["Dairy", "Frozen", "Snacks"]
+    dairy = frame.iloc[0]
+    assert dairy["credit_note_lines"] == 3
+    assert dairy["credit_note_value_inr"] == pytest.approx(100.0)
+    assert dairy["leading_reason_code"] == "RT07_TRANSIT_DAMAGE"
+    assert dairy["leading_reason_credit_note_lines"] == 2
+    assert dairy["leading_reason_credit_note_value_inr"] == pytest.approx(50.0)
+    assert dairy["leading_reason_share_of_category_value"] == pytest.approx(0.5)
+    snacks = frame.iloc[2]
+    assert snacks["leading_reason_code"] == "RT09_EXPIRED"
+    assert frame.attrs["status_scope"] == ("APPROVED",)
+    assert "reason code ascending" in frame.attrs["leading_reason_ranking"]
+
+
+def test_return_category_leading_reason_normalizes_labels_before_aggregation(
+    service: AnalyticsService,
+) -> None:
+    filters = FilterSet(date(2026, 4, 1), date(2026, 4, 30))
+    with duckdb.connect(str(service.database_path)) as connection:
+        connection.execute(
+            """
+            INSERT INTO fct_return_credit_note
+            SELECT * REPLACE (
+                20 AS return_id,
+                10.0 AS credit_note_value_inr,
+                'CN-20' AS credit_note_number,
+                CAST(NULL AS VARCHAR) AS category,
+                CAST(NULL AS VARCHAR) AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            UNION ALL
+            SELECT * REPLACE (
+                21 AS return_id,
+                20.0 AS credit_note_value_inr,
+                'CN-21' AS credit_note_number,
+                '' AS category,
+                '' AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            UNION ALL
+            SELECT * REPLACE (
+                22 AS return_id,
+                30.0 AS credit_note_value_inr,
+                'CN-22' AS credit_note_number,
+                '   ' AS category,
+                '   ' AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            UNION ALL
+            SELECT * REPLACE (
+                23 AS return_id,
+                25.0 AS credit_note_value_inr,
+                'CN-23' AS credit_note_number,
+                ' Dairy ' AS category,
+                ' RT06_COLD_CHAIN_BREACH ' AS return_reason_code
+            )
+            FROM fct_return_credit_note WHERE return_id = 1
+            """
+        )
+
+    frame = service.returns_by_category_with_leading_reason(
+        filters,
+        statuses=("APPROVED",),
+        limit=10,
+    )
+
+    assert frame["category"].tolist() == ["Dairy", "UNSPECIFIED"]
+    dairy = frame.iloc[0]
+    assert dairy["credit_note_lines"] == 2
+    assert dairy["credit_note_value_inr"] == pytest.approx(75.0)
+    assert dairy["leading_reason_code"] == "RT06_COLD_CHAIN_BREACH"
+    assert dairy["leading_reason_credit_note_lines"] == 2
+    assert dairy["leading_reason_credit_note_value_inr"] == pytest.approx(75.0)
+    unspecified = frame.iloc[1]
+    assert unspecified["credit_note_lines"] == 3
+    assert unspecified["credit_note_value_inr"] == pytest.approx(60.0)
+    assert unspecified["leading_reason_code"] == "UNSPECIFIED"
+    assert unspecified["leading_reason_credit_note_lines"] == 3
+    assert unspecified["leading_reason_credit_note_value_inr"] == pytest.approx(60.0)
+    assert unspecified["leading_reason_share_of_category_value"] == pytest.approx(1.0)
+
+
 def test_cold_chain_return_summary_is_not_limited_by_evidence_rows(
     service: AnalyticsService,
 ) -> None:
@@ -660,7 +828,8 @@ def test_cold_chain_return_summary_is_not_limited_by_evidence_rows(
                    warehouse_region_name, warehouse_code, route_code, outlet_code,
                    channel, credit_note_status, 75.0 AS credit_note_value_inr,
                    'CN-2' AS credit_note_number, order_id, order_line_id,
-                   outlet_name, sku_code, product_name, qty_uom, return_qty_raw,
+                   outlet_name, sku_code, product_name, category, qty_uom,
+                   return_qty_raw,
                    return_qty_normalized, return_sign_was_negative, return_eaches,
                    return_case_equivalents, return_reason_code, is_cold_chain_return,
                    disposition, source_system, promotion_code, promotion_name,

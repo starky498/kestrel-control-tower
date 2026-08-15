@@ -9,7 +9,7 @@ setup:
 	$(PYTHON) -m venv $(VENV)
 	$(BIN)/python -m pip install --upgrade pip
 	$(BIN)/pip install -r requirements-dev.lock
-	$(BIN)/pip install --no-deps --editable .
+	$(BIN)/pip install --no-deps .
 
 setup-local-nlp: setup
 	$(RUN_ENV) $(BIN)/python scripts/download_nlq_model.py

@@ -40,7 +40,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    SRC["Read-only SQLite source\n13 tables / 818,901 rows"] --> VAL["Schema, grain, FK, parity,\nand conflict contracts"]
+    SRC["Read-only SQLite source\n13 tables / 818,901 rows"] --> VAL["Schema, grain, FK, CSV header/row counts,\nand conflict contracts"]
     VAL --> STAGE["Staged DuckDB build"]
     SQL["Governed SQL dimensions and facts"] --> STAGE
     PRIOR["Prior ext_* tables and compatible views"] --> STAGE
@@ -92,7 +92,8 @@ it; a missing MiniLM model leaves Ask Kestrel in rules-only mode.
 1. **Configuration** resolves project-relative or explicit environment paths. Secrets remain in a
    local `.env`; generated state remains under `.kestrel/`.
 2. **Source contracts** open SQLite read-only and validate the 13 declared schemas, primary grains,
-   relationships, quantities, CSV parity, and known conflicts before transformation.
+   relationships, quantities, exact CSV header order, CSV-versus-SQLite row counts, and known
+   conflicts before transformation. It does not claim cell-by-cell CSV equality.
 3. **Warehouse construction** streams raw tables, preserves raw and normalized values, executes
    governed SQL, checks model grains and totals, and publishes DuckDB and Parquet together.
 4. **Integration adapters** validate, retry, checkpoint, cache, and publish external observations

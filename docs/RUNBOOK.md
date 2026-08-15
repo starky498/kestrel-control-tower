@@ -60,9 +60,10 @@ git check-ignore data/source/data/kestrel_ops.db .env .kestrel/kestrel.duckdb \
 make start
 ```
 
-This creates `.venv`, installs version-pinned `requirements-dev.lock` packages plus the editable
-project with `--no-deps`, runs doctor and source validation, stages DuckDB and Parquet, promotes
-each without exposing a partial artifact, collects the bundled BazaarPulse site, then starts Streamlit at
+This creates `.venv`, installs version-pinned `requirements-dev.lock` packages plus the local
+project wheel with `--no-deps`, runs doctor and source validation, stages DuckDB and Parquet,
+promotes each without exposing a partial artifact, collects the bundled BazaarPulse site, then starts
+Streamlit at
 [http://localhost:8501](http://localhost:8501).
 
 `make start` does not synchronize freight, weather, or holidays. Those are optional, explicit
@@ -284,8 +285,8 @@ make test
 git diff --check
 ```
 
-`make lint` runs Ruff and mypy. `make test` runs the deterministic pytest suite; the 15 August 2026
-release run passed all 239 tests. Generated external data is not required for unit tests.
+`make lint` runs Ruff and mypy. `make test` runs the complete deterministic pytest suite, which
+passes on the current repository state. Generated external data is not required for unit tests.
 
 ### Eight-workspace audit
 
@@ -303,10 +304,10 @@ control, or exceeds 15,000 ms for the measured page render. Inspect `passed`,
 time is recorded for diagnosis; the implemented threshold gate applies to each workspace render.
 
 The automated audit is not WCAG conformance evidence. Complete the manual checks in
-`docs/ACCESSIBILITY_PERFORMANCE.md` separately. The 15 August 2026 local release run passed all
-eight workspaces; initial render was 1,334.872 ms and its slowest measured page rerender was
-Executive Command Center at 421.756 ms, with no missing heading, exception/error, or unlabelled control. Refresh
-the ignored JSON report after any material change.
+`docs/ACCESSIBILITY_PERFORMANCE.md` separately. The 16 August 2026 local release run passed all
+eight workspaces; initial render was 1,749.788 ms and its slowest measured page rerender was
+Executive Command Center at 648.406 ms, with no missing heading, exception/error, or unlabelled
+control. Refresh the ignored JSON report after any material change.
 
 ### Governed-question benchmark
 
@@ -326,8 +327,8 @@ validation, two additional local-semantic paraphrase cases run. The generated re
 evidence and is excluded from Git. Treat a missing optional snapshot as a failed benchmark
 precondition, not permission to weaken the expected answer contract.
 
-The 15 August 2026 release benchmark passed 19/19 applicable cases with the local model installed;
-its slowest case was 297.479 ms.
+The 16 August 2026 release benchmark passed 20/20 applicable cases with the local model installed;
+its slowest case was 379.274 ms.
 
 ### Operation log
 

@@ -1505,6 +1505,114 @@ class AnalyticsService:
         frame.attrs["dimension_label"] = label
         return frame
 
+    def returns_by_category_with_leading_reason(
+        self,
+        filters: FilterSet,
+        *,
+        statuses: tuple[str, ...] = ("APPROVED",),
+        limit: int = 20,
+    ) -> pd.DataFrame:
+        """Rank return categories and retain one deterministic leading reason per category."""
+
+        if not statuses:
+            raise ValueError("At least one credit-note status is required")
+        if limit < 1 or limit > 1_000:
+            raise ValueError("limit must be between 1 and 1000")
+        where, parameters = self._filter_sql(filters, date_column="return_date")
+        status_placeholders = ", ".join("?" for _ in statuses)
+        parameters.extend(statuses)
+        parameters.append(limit)
+        sql = f"""
+            WITH normalized_returns AS (
+                SELECT coalesce(
+                           nullif(trim(category), ''),
+                           'UNSPECIFIED'
+                       ) AS normalized_category,
+                       coalesce(
+                           nullif(trim(return_reason_code), ''),
+                           'UNSPECIFIED'
+                       ) AS normalized_return_reason_code,
+                       return_eaches,
+                       return_case_equivalents,
+                       credit_note_value_inr
+                FROM fct_return_credit_note
+                WHERE {where} AND credit_note_status IN ({status_placeholders})
+            ), reason_totals AS (
+                SELECT normalized_category AS category,
+                       normalized_return_reason_code AS return_reason_code,
+                       count(*) AS reason_credit_note_lines,
+                       sum(return_eaches) AS reason_return_eaches,
+                       sum(return_case_equivalents) AS reason_return_case_equivalents,
+                       sum(credit_note_value_inr) AS reason_credit_note_value_inr
+                FROM normalized_returns
+                GROUP BY normalized_category, normalized_return_reason_code
+            ), ranked AS (
+                SELECT category,
+                       return_reason_code,
+                       reason_credit_note_lines,
+                       reason_return_eaches,
+                       reason_return_case_equivalents,
+                       reason_credit_note_value_inr,
+                       sum(reason_credit_note_lines) OVER (
+                           PARTITION BY category
+                       ) AS credit_note_lines,
+                       sum(reason_return_eaches) OVER (
+                           PARTITION BY category
+                       ) AS return_eaches,
+                       sum(reason_return_case_equivalents) OVER (
+                           PARTITION BY category
+                       ) AS return_case_equivalents,
+                       sum(reason_credit_note_value_inr) OVER (
+                           PARTITION BY category
+                       ) AS credit_note_value_inr,
+                       row_number() OVER (
+                           PARTITION BY category
+                           ORDER BY reason_credit_note_value_inr DESC,
+                                    reason_credit_note_lines DESC,
+                                    return_reason_code ASC
+                       ) AS reason_rank
+                FROM reason_totals
+            )
+            SELECT category,
+                   credit_note_lines,
+                   return_eaches,
+                   return_case_equivalents,
+                   credit_note_value_inr,
+                   return_reason_code AS leading_reason_code,
+                   reason_credit_note_lines AS leading_reason_credit_note_lines,
+                   reason_return_eaches AS leading_reason_return_eaches,
+                   reason_return_case_equivalents
+                       AS leading_reason_return_case_equivalents,
+                   reason_credit_note_value_inr
+                       AS leading_reason_credit_note_value_inr,
+                   reason_credit_note_value_inr
+                       / nullif(credit_note_value_inr, 0)
+                       AS leading_reason_share_of_category_value
+            FROM ranked
+            WHERE reason_rank = 1
+            ORDER BY credit_note_value_inr DESC,
+                     credit_note_lines DESC,
+                     category ASC
+            LIMIT ?
+        """
+        with self._connect() as connection:
+            frame = connection.execute(sql, parameters).fetchdf()
+        frame.attrs.update(
+            {
+                "status_scope": statuses,
+                "date_basis": "return_date",
+                "category_ranking": (
+                    "Credit-note value descending, then credit-note lines descending, then "
+                    "category ascending."
+                ),
+                "leading_reason_ranking": (
+                    "Within each category: credit-note value descending, then credit-note "
+                    "lines descending, then reason code ascending."
+                ),
+            }
+        )
+        return frame
+
     def credit_status_summary(self, filters: FilterSet) -> pd.DataFrame:
         where, parameters = self._filter_sql(filters, date_column="return_date")
         sql = f"""

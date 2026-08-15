@@ -187,8 +187,11 @@ Pending and rejected values remain visible separately. Return quantities are nor
 originating line's order-time pack and sign rules.
 
 The dispatch fraction is capped per line, so oversupply cannot inflate the denominator. Ask
-Kestrel ranks only APPROVED value by the requested category/reason dimension and appends a separate
-APPROVED/PENDING/REJECTED workflow-status evidence block.
+Kestrel ranks only APPROVED value by the requested dimension and appends a separate
+APPROVED/PENDING/REJECTED workflow-status evidence block. For the combined category-and-reason
+question, category totals rank by approved value, then line count, then category name. The leading
+reason within each category ranks by approved value, then line count, then reason code. This is a
+deterministic nested breakdown, not two unrelated grouping queries.
 
 The short-delivery calculation is a proportional booked-value exposure on eligible completed order
 lines with positive ordered quantity. It is ranked by recorded dimensions including product,

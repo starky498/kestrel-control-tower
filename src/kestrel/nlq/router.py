@@ -170,6 +170,7 @@ class QuestionIntent:
     late_threshold_minutes: int = 120
     rate_threshold: float = 0.10
     explain_change: bool = False
+    leading_return_reason: bool = False
     resolver: str = "rules"
     resolver_provenance: str | None = None
     resolver_confidence: float | None = None
@@ -207,6 +208,8 @@ class QuestionIntent:
             )
         if self.explain_change:
             details.append("analysis=period-over-period measured contribution")
+        if self.leading_return_reason:
+            details.append("return reason selection=leading per category")
         details.append(f"resolver={self.resolver}")
         if self.resolver_provenance is not None:
             details.append(f"resolver provenance={self.resolver_provenance}")
@@ -340,6 +343,14 @@ class MetricService(Protocol):
         limit: int = 20,
     ) -> pd.DataFrame: ...
 
+    def returns_by_category_with_leading_reason(
+        self,
+        filters: FilterSet,
+        *,
+        statuses: tuple[str, ...] = ("APPROVED",),
+        limit: int = 20,
+    ) -> pd.DataFrame: ...
+
     def credit_status_summary(self, filters: FilterSet) -> pd.DataFrame: ...
 
     def discontinued_order_evidence(
@@ -423,8 +434,10 @@ _SPECS: dict[MetricKey, _MetricSpec] = {
     ),
     MetricKey.RETURNS: _MetricSpec(
         "Approved credit-note value and normalized absolute return quantity, grouped by "
-        "the requested dimension. Pending and rejected notes are excluded from that headline "
-        "and shown separately as workflow-status evidence.",
+        "the requested dimension. For the governed category-and-reason question, categories "
+        "are ranked by approved value and the leading reason is selected within each category. "
+        "Pending and rejected notes are excluded from that headline and shown separately as "
+        "workflow-status evidence.",
         ("fct_return_credit_note", "returns_credit_notes", "products"),
     ),
     MetricKey.CHILLED_EXCURSIONS: _MetricSpec(
@@ -1063,6 +1076,34 @@ def _unsupported_filter_fields(intent: QuestionIntent) -> tuple[str, ...]:
     )
 
 
+_LEADING_RETURN_REASON_PATTERN = re.compile(
+    r"\b(?:leading|top|main|primary|dominant)\s+"
+    r"(?:return\s+)?reasons?(?:\s+codes?)?\b"
+)
+
+
+def _requests_leading_return_reason(
+    text: str,
+    metric: MetricKey,
+    dimensions: tuple[DimensionKey, ...],
+) -> bool:
+    return (
+        metric == MetricKey.RETURNS
+        and len(dimensions) == 2
+        and set(dimensions) == {DimensionKey.CATEGORY, DimensionKey.RETURN_REASON}
+        and bool(_LEADING_RETURN_REASON_PATTERN.search(text))
+    )
+
+
+def _is_return_category_reason_intent(intent: QuestionIntent) -> bool:
+    return (
+        intent.metric == MetricKey.RETURNS
+        and len(intent.dimensions) == 2
+        and set(intent.dimensions) == {DimensionKey.CATEGORY, DimensionKey.RETURN_REASON}
+        and intent.leading_return_reason
+    )
+
+
 def _multi_dimension_error(intent: QuestionIntent) -> str | None:
     if len(intent.dimensions) <= 1:
         return None
@@ -1070,6 +1111,8 @@ def _multi_dimension_error(intent: QuestionIntent) -> str | None:
         DimensionKey.OUTLET,
         DimensionKey.SKU,
     }:
+        return None
+    if _is_return_category_reason_intent(intent):
         return None
     names = ", ".join(dimension.value for dimension in intent.dimensions)
     return (
@@ -1725,6 +1768,11 @@ class QuestionRouter:
                     re.search(r"\bwhy\b", text)
                     or re.search(r"\b(?:dropped|changed|declined)\b", text)
                 )
+            ),
+            leading_return_reason=_requests_leading_return_reason(
+                text,
+                metric,
+                dimensions,
             ),
             resolver=(
                 "local_semantic"
@@ -2672,6 +2720,60 @@ class QuestionRouter:
 
     def _returns(self, intent: QuestionIntent) -> QuestionAnswer:
         filters = intent.filters.to_metric_filters(intent.period)
+        if _is_return_category_reason_intent(intent):
+            frame = self.metric_service.returns_by_category_with_leading_reason(
+                filters,
+                statuses=("APPROVED",),
+                limit=1_000,
+            )
+            if not frame.empty:
+                ascending = _ranking_ascending(intent, adverse=True)
+                frame = frame.sort_values(
+                    ["credit_note_value_inr", "credit_note_lines", "category"],
+                    ascending=[ascending, ascending, True],
+                    na_position="last",
+                    kind="mergesort",
+                )
+            frame = frame.head(intent.limit or 20)
+            category_reason = _frame_evidence(
+                "Approved return value by category with leading reason",
+                "fct_return_credit_note",
+                frame,
+            )
+            status = self.metric_service.credit_status_summary(filters)
+            workflow_status = _frame_evidence(
+                "Credit-note workflow status",
+                "fct_return_credit_note",
+                status,
+            )
+            if frame.empty:
+                summary = "No approved return category or reason evidence was found."
+            else:
+                leading = frame.iloc[0]
+                summary = (
+                    f"{leading['category']} has the {_ranking_label(intent, adverse=True)} "
+                    "approved return value at "
+                    f"₹{_format_number(leading['credit_note_value_inr'])}; "
+                    f"its leading reason code is {leading['leading_reason_code']} at "
+                    f"₹{_format_number(leading['leading_reason_credit_note_value_inr'])} "
+                    f"({_format_percent(leading['leading_reason_share_of_category_value'])} "
+                    "of that category's approved value)."
+                )
+            return self._base_answer(
+                intent,
+                summary,
+                (category_reason, workflow_status),
+                warnings=(
+                    "Only APPROVED credit notes drive category totals and leading-reason "
+                    "selection; PENDING and REJECTED rows are shown separately as workflow "
+                    "evidence.",
+                    "Categories are ordered by approved value, then line count, then category. "
+                    "Within each category, reason ties are resolved by approved value, then "
+                    "line count, then reason code. Values use return date and are measured "
+                    "credit-note exposure, not causal attribution, profit, or cash recovery.",
+                ),
+            )
+
         evidence: list[EvidenceBlock] = []
         for dimension in intent.dimensions or (DimensionKey.CATEGORY,):
             frame = self.metric_service.returns_by_dimension(

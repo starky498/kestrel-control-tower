@@ -78,8 +78,8 @@ source database.
 ### Version-pinned dependency installation
 
 `make start` installs the version-pinned `requirements-dev.lock` application/tool package set, then
-installs the project in editable mode with `--no-deps`. CI uses the same development lock; Docker
-uses the pinned runtime lock. The equivalent non-editable local path is:
+installs the local project wheel with `--no-deps`. CI uses the same development lock; Docker uses
+the pinned runtime lock. The equivalent manual path is:
 
 ```bash
 python3 -m venv .venv
@@ -218,7 +218,7 @@ See [docs/COMPETITOR_MATCH_GOVERNANCE.md](docs/COMPETITOR_MATCH_GOVERNANCE.md).
 ```bash
 make prepare          # doctor + validation + staged build + BazaarPulse snapshot
 make setup-local-nlp  # optional keyless, verified ~23 MB local paraphrase model
-make validate-data    # 93 schema, grain, FK, parity, and conflict checks
+make validate-data    # 93 schema, grain, FK, CSV-header/row-count, and conflict checks
 make build            # staged SQLite -> DuckDB + Parquet manifest with rollback
 make scrape-prices    # allowed local scrape, matching, overrides, current + history
 make sync-freight     # resilient complete-history carrier synchronization
@@ -227,7 +227,7 @@ make run              # start Streamlit without rebuilding
 make test             # deterministic test suite
 make lint             # Ruff + mypy
 make audit            # eight-workspace label/error/control/15s audit
-make benchmark        # 17 baseline cases; 19 with a verified model; external snapshots required
+make benchmark        # 18 baseline cases; 20 with a verified model; external snapshots required
 make quality          # lint + test + audit + governed-question benchmark
 make clean            # confirmation guard; no deletion without the explicit --yes command
 ```
@@ -243,14 +243,14 @@ PYTHONPATH=src .venv/bin/python scripts/audit_ui.py \
 
 The audit fails unless exactly eight workspaces are discovered. Each must render in no more than
 15,000 ms with a visible heading, no Streamlit exception/error, and no unlabelled interactive
-control. The 15 August 2026 local release run passed 239 tests and all eight workspaces: no
-exceptions, errors, missing headings, or unlabelled controls; initial render was 1,334.872 ms and
-the slowest measured page rerender was Executive Command Center at 421.756 ms. The governed-question
-benchmark also passed all 19 applicable cases, including two installed-model paraphrases, with its
-slowest case at 297.479 ms. Generated
-JSON evidence remains ignored and should be refreshed on the review machine. This automated audit
-does not establish WCAG conformance; manual keyboard, focus, contrast, zoom, and screen-reader
-checks remain pending and separate.
+control. The complete deterministic test suite passes on the current repository state. The
+16 August 2026 recorded audit passed all eight workspaces: no exceptions, errors, missing headings,
+or unlabelled controls; initial render was 1,749.788 ms and the slowest measured page rerender was
+Executive Command Center at 648.406 ms. The governed-question benchmark also passed all 20
+applicable cases, including two installed-model paraphrases, with its slowest case at 379.274 ms.
+Generated JSON evidence remains ignored and should be refreshed on the review machine. This
+automated audit does not establish WCAG conformance; manual keyboard, focus, contrast, zoom, and
+screen-reader checks remain pending and separate.
 
 ## Docker
 
