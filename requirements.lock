@@ -34,22 +34,35 @@ charset-normalizer==3.5.0
     # via requests
 click==8.4.2
     # via
+    #   huggingface-hub
     #   streamlit
     #   uvicorn
 duckdb==1.5.5
     # via kestrel-control-tower (pyproject.toml)
 fastapi==0.141.1
     # via kestrel-control-tower (pyproject.toml)
+filelock==3.32.3
+    # via huggingface-hub
+flatbuffers==25.12.19
+    # via onnxruntime
+fsspec==2026.7.0
+    # via huggingface-hub
 h11==0.16.0
     # via
     #   httpcore
     #   uvicorn
+hf-xet==1.6.0
+    # via huggingface-hub
 httpcore==1.0.9
     # via httpx
 httptools==0.8.0
     # via streamlit
 httpx==0.28.1
-    # via kestrel-control-tower (pyproject.toml)
+    # via
+    #   huggingface-hub
+    #   kestrel-control-tower (pyproject.toml)
+huggingface-hub==1.27.0
+    # via tokenizers
 idna==3.18
     # via
     #   anyio
@@ -77,12 +90,17 @@ narwhals==2.24.0
     #   plotly
 numpy==2.4.6
     # via
+    #   onnxruntime
     #   pandas
     #   pydeck
     #   streamlit
+onnxruntime==1.28.0
+    # via kestrel-control-tower (pyproject.toml)
 packaging==26.3
     # via
     #   altair
+    #   huggingface-hub
+    #   onnxruntime
     #   plotly
     #   streamlit
 pandas==2.3.3
@@ -94,7 +112,9 @@ pillow==12.3.0
 plotly==6.9.0
     # via kestrel-control-tower (pyproject.toml)
 protobuf==7.35.1
-    # via streamlit
+    # via
+    #   onnxruntime
+    #   streamlit
 pyarrow==24.0.0
     # via streamlit
 pydantic==2.13.4
@@ -116,7 +136,9 @@ python-multipart==0.0.32
 pytz==2026.3.post1
     # via pandas
 pyyaml==6.0.3
-    # via kestrel-control-tower (pyproject.toml)
+    # via
+    #   huggingface-hub
+    #   kestrel-control-tower (pyproject.toml)
 rapidfuzz==3.14.5
     # via kestrel-control-tower (pyproject.toml)
 referencing==0.37.0
@@ -147,8 +169,12 @@ tenacity==9.1.4
     # via
     #   kestrel-control-tower (pyproject.toml)
     #   streamlit
+tokenizers==0.23.1
+    # via kestrel-control-tower (pyproject.toml)
 toml==0.10.2
     # via streamlit
+tqdm==4.70.0
+    # via huggingface-hub
 typer==0.27.1
     # via kestrel-control-tower (pyproject.toml)
 typing-extensions==4.16.0
@@ -157,6 +183,7 @@ typing-extensions==4.16.0
     #   anyio
     #   beautifulsoup4
     #   fastapi
+    #   huggingface-hub
     #   pydantic
     #   pydantic-core
     #   referencing

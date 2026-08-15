@@ -1,0 +1,197 @@
+version: "1.0.0"
+
+# This catalogue teaches a local embedding model how business wording maps to a
+# governed intent key. It contains no SQL, formula, or query-generation instruction.
+intents:
+  fill_rate:
+    label: Fill rate
+    availability: active
+    examples:
+      - Which warehouses are failing to supply everything customers ordered?
+      - Where are the largest quantity shortfalls against customer orders?
+      - Show fulfilment performance by distribution centre.
+      - Which outlets received the smallest share of what they requested?
+      - Rank service levels by customer region.
+
+  strict_otif:
+    label: Strict OTIF
+    availability: active
+    examples:
+      - What percentage of orders arrived on time and completely in full?
+      - Show strict OTIF performance by warehouse.
+      - Which regions received complete orders by the promised time?
+      - Rank distribution centres by on-time in-full delivery.
+
+  returns:
+    label: Returns and credit notes
+    availability: active
+    examples:
+      - Which categories have the highest approved returns?
+      - Show credit-note value by return reason.
+      - Where is product return leakage highest?
+      - Rank warehouses by approved credit notes.
+
+  chilled_excursions:
+    label: Chilled-delivery temperature excursions
+    availability: active
+    examples:
+      - Which warehouses have the most cold-chain problems?
+      - Show temperature excursion rates for chilled deliveries.
+      - Where is refrigerated delivery performance weakest?
+      - Rank routes by chilled temperature incidents.
+
+  late_routes:
+    label: Late routes
+    availability: active
+    examples:
+      - Which routes are repeatedly more than two hours late?
+      - Show transport lanes with frequent severe delays.
+      - Where are route delays above the review threshold?
+      - Rank the worst delivery routes for lateness.
+
+  market_price_gap:
+    label: Competitor price gap
+    availability: active
+    examples:
+      - Which products are priced above the cheapest competitor?
+      - Show the largest gaps between Kestrel MRP and market shelf price.
+      - Where are competitors undercutting our product prices?
+      - Rank SKUs by competitor price gap.
+
+  freight_per_case:
+    label: Freight cost per delivered case
+    availability: active
+    examples:
+      - Which depots have the highest transport cost per delivered case?
+      - Show freight efficiency by route.
+      - Where are carrier costs per case most expensive?
+      - Rank warehouses by freight spend per carton delivered.
+
+  discontinued_skus:
+    label: Orders after SKU discontinuation
+    availability: active
+    examples:
+      - Which discontinued products were still ordered?
+      - Show orders placed after a SKU was withdrawn.
+      - Which outlets purchased products after their discontinuation date?
+      - Find post-discontinuation order lines.
+
+  allocation_rate:
+    label: Allocation rate
+    availability: active
+    examples:
+      - How much ordered stock was allocated to customers?
+      - Which warehouses have the poorest allocation rate?
+      - Where are orders not receiving enough allocated quantity?
+      - Rank outlets by stock allocation performance.
+
+  post_allocation_fulfilment:
+    label: Post-allocation fulfilment
+    availability: active
+    examples:
+      - How much allocated stock was actually fulfilled?
+      - Where are deliveries falling short after allocation?
+      - Which warehouses fail to dispatch their allocated quantities?
+      - Show fulfilment against allocated rather than ordered quantity.
+      - Which depots keep falling short after stock has already been assigned?
+
+  backlog:
+    label: Overdue backlog
+    availability: active
+    examples:
+      - Which open customer orders are overdue?
+      - Show warehouses with the largest overdue backlog.
+      - Where are unfulfilled past-due orders accumulating?
+      - Rank outlets by overdue open orders.
+
+  on_time_rate:
+    label: Requested-cohort timestamp-derived on-time delivery
+    availability: active
+    examples:
+      - What share of requested deliveries arrived by the promised time?
+      - Which warehouses have the worst requested-cohort on-time rate?
+      - Show service punctuality by customer region using the promise-date cohort.
+      - Rank routes by requested-date timestamp performance.
+
+  delivery_on_time_rate:
+    label: Actual-delivery-cohort timestamp-derived on-time delivery
+    availability: active
+    examples:
+      - What share of actual-date deliveries arrived by the planned time?
+      - Which warehouses have the worst operational delivery punctuality?
+      - Show on-time performance using the actual delivery cohort.
+      - Rank routes by actual-delivery-date timing performance.
+
+  pod_coverage:
+    label: Proof-of-delivery coverage
+    availability: active
+    examples:
+      - Which deliveries are missing proof of delivery?
+      - Show POD document coverage by warehouse.
+      - Where is delivery confirmation evidence incomplete?
+      - Rank routes by proof-of-delivery coverage.
+      - How many drops lack receiving evidence?
+
+  delivery_failures:
+    label: Recorded delivery failure rate
+    availability: active
+    examples:
+      - Which routes have the most recorded delivery failures?
+      - Show failed-delivery rates by warehouse.
+      - Where are delivery attempts being marked as failed?
+      - Rank customer regions by delivery failure incidents.
+
+  short_delivery_exposure:
+    label: Short-delivery booked-value exposure
+    availability: active
+    examples:
+      - Where is the greatest booked value exposed by short deliveries?
+      - Show the commercial exposure from undelivered ordered quantity.
+      - Which categories have the highest short-delivery value?
+      - Rank warehouses by booked-value service exposure.
+      - Show commercial value at risk from partial deliveries.
+
+  inventory_risk:
+    label: Near-expiry inventory
+    availability: active
+    examples:
+      - Which warehouses hold the most stock close to expiry?
+      - Show available cases expiring in the next thirty days.
+      - Which products have the greatest near-expiry inventory risk?
+      - Rank SKUs by cases approaching expiry.
+
+  credit_note_leakage:
+    label: Credit-note leakage
+    availability: active
+    examples:
+      - What share of delivered value became approved credit notes?
+      - Show the approved returns leakage rate.
+      - Calculate the source-wide approved credit-note leakage rate.
+      - How large is approved credit leakage compared with delivered value?
+
+  competitor_coverage:
+    label: Competitor match coverage
+    availability: active
+    examples:
+      - What percentage of products have a reliable competitor match?
+      - Show source-wide market-price matching coverage.
+      - Where are competitor product matches missing?
+      - How complete is the BazaarPulse matching evidence?
+
+  weather_association:
+    label: Weather association
+    availability: active
+    examples:
+      - How does severe weather coincide with service performance?
+      - Show delivery metrics alongside rainfall and temperature conditions.
+      - Which weather conditions are associated with the weakest fulfilment?
+      - Compare service levels on severe-weather days with normal days.
+
+  holiday_association:
+    label: Holiday association
+    availability: active
+    examples:
+      - How does service performance differ around public holidays?
+      - Show fulfilment metrics for holiday and non-holiday dates.
+      - Which holidays coincide with the largest delivery disruption?
+      - Compare delivery performance before and after holidays.

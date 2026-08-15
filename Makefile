@@ -1,15 +1,18 @@
 PYTHON ?= python3
 VENV := .venv
 BIN := $(VENV)/bin
-RUN_ENV := PYTHONPATH=$(CURDIR)/src
+RUN_ENV := env PYTHONPATH="$(CURDIR)/src"
 
-.PHONY: setup start prepare doctor validate-data build sync-freight sync-context scrape-prices run market-api test lint audit benchmark quality clean
+.PHONY: setup setup-local-nlp start prepare doctor validate-data build sync-freight sync-context scrape-prices run market-api test lint audit benchmark quality clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
 	$(BIN)/python -m pip install --upgrade pip
 	$(BIN)/pip install -r requirements-dev.lock
 	$(BIN)/pip install --no-deps --editable .
+
+setup-local-nlp: setup
+	$(RUN_ENV) $(BIN)/python scripts/download_nlq_model.py
 
 start: setup doctor validate-data build scrape-prices run
 

@@ -166,6 +166,34 @@ def service(tmp_path: Path) -> AnalyticsService:
     return AnalyticsService(database)
 
 
+@pytest.mark.parametrize(
+    ("date_basis", "expected_range"),
+    (
+        ("requested_delivery", (date(2026, 3, 11), date(2026, 4, 13))),
+        ("actual_delivery", (date(2026, 4, 11), date(2026, 4, 13))),
+        ("returns", (date(2026, 4, 20), date(2026, 4, 20))),
+        ("inventory", (date(2026, 4, 27), date(2026, 4, 27))),
+    ),
+)
+def test_available_date_range_uses_governed_date_basis(
+    service: AnalyticsService,
+    date_basis: str,
+    expected_range: tuple[date, date],
+) -> None:
+    assert service.available_date_range(date_basis) == expected_range
+
+
+def test_available_date_range_defaults_to_requested_delivery_and_rejects_unknown_basis(
+    service: AnalyticsService,
+) -> None:
+    assert service.available_date_range() == (
+        date(2026, 3, 11),
+        date(2026, 4, 13),
+    )
+    with pytest.raises(ValueError, match="Unsupported date basis"):
+        service.available_date_range("requested_delivery; DROP TABLE fct_delivery")
+
+
 def test_executive_summary_uses_weighted_ratio_of_sums(service: AnalyticsService) -> None:
     filters = FilterSet(date(2026, 4, 1), date(2026, 4, 30))
     summary = service.executive_summary(filters, QuantityBasis.EACHES)
@@ -193,9 +221,7 @@ def test_executive_timing_rates_exclude_missing_parsed_timestamps(
             """
         )
 
-    summary = service.executive_summary(
-        FilterSet(date(2026, 4, 1), date(2026, 4, 30))
-    )
+    summary = service.executive_summary(FilterSet(date(2026, 4, 1), date(2026, 4, 30)))
 
     assert summary["on_time_rate"].value == 1.0
     assert summary["on_time_rate"].denominator == 1.0
@@ -212,12 +238,10 @@ def test_fill_rate_caps_delivery_at_ordered_quantity_per_line(
             "ALTER TABLE fct_order_service ALTER capped_delivered_eaches TYPE DOUBLE"
         )
         connection.execute(
-            "ALTER TABLE fct_order_service "
-            "ALTER delivered_case_equivalents TYPE DOUBLE"
+            "ALTER TABLE fct_order_service ALTER delivered_case_equivalents TYPE DOUBLE"
         )
         connection.execute(
-            "ALTER TABLE fct_order_service "
-            "ALTER capped_delivered_case_equivalents TYPE DOUBLE"
+            "ALTER TABLE fct_order_service ALTER capped_delivered_case_equivalents TYPE DOUBLE"
         )
         connection.execute(
             """
@@ -352,12 +376,8 @@ def test_service_rankings_apply_volume_and_comparable_period_rules(
 ) -> None:
     filters = FilterSet(date(2026, 4, 1), date(2026, 4, 30))
 
-    best = service.service_rankings(
-        filters, "warehouse", ranking="best", min_orders=1
-    )
-    improved = service.service_rankings(
-        filters, "warehouse", ranking="most_improved", min_orders=1
-    )
+    best = service.service_rankings(filters, "warehouse", ranking="best", min_orders=1)
+    improved = service.service_rankings(filters, "warehouse", ranking="most_improved", min_orders=1)
 
     assert best.iloc[0]["dimension_value"] == "WH02"
     assert best.attrs["min_orders"] == 1
@@ -371,9 +391,7 @@ def test_delivery_exception_metrics_keep_conflicts_and_evidence_visible(
     filters = FilterSet(date(2026, 4, 1), date(2026, 4, 30))
 
     summary = service.delivery_exception_summary(filters)
-    routes = service.delivery_exceptions_by_dimension(
-        filters, "route", min_deliveries=1
-    )
+    routes = service.delivery_exceptions_by_dimension(filters, "route", min_deliveries=1)
     pareto = service.failure_reason_pareto(filters)
     evidence = service.delivery_exception_evidence(filters)
 
@@ -383,6 +401,8 @@ def test_delivery_exception_metrics_keep_conflicts_and_evidence_visible(
     assert summary["delay_source_conflict_rate"].value == pytest.approx(0.5)
     assert summary["recorded_failure_rate"].value == pytest.approx(0.5)
     assert routes.iloc[0]["dimension_value"] == "RT0002"
+    assert routes.iloc[0]["recorded_failures"] == 1
+    assert routes.iloc[0]["recorded_failure_rate"] == pytest.approx(1.0)
     assert pareto.iloc[0]["failure_reason_code"] == "DF01"
     assert pareto.iloc[0]["cumulative_share"] == pytest.approx(1.0)
     assert evidence.iloc[0]["delivery_note_number"] == "DN-2"
@@ -399,6 +419,45 @@ def test_delivery_exception_dimension_and_threshold_are_governed(
         service.delivery_exceptions_by_dimension(filters, "driver_name")
     with pytest.raises(ValueError, match="min_deliveries must be positive"):
         service.delivery_exceptions_by_dimension(filters, "route", min_deliveries=0)
+
+
+def test_backlog_breakdown_is_as_of_current_open_source_state(
+    service: AnalyticsService,
+) -> None:
+    filters = FilterSet(date(2026, 4, 20), date(2026, 4, 30))
+
+    frame = service.backlog_by_dimension(filters, "warehouse", QuantityBasis.EACHES)
+
+    assert frame.iloc[0]["dimension_value"] == "WH01"
+    assert frame.iloc[0]["overdue_orders"] == 1
+    assert frame.iloc[0]["overdue_ordered_quantity"] == 50
+    assert frame.iloc[0]["oldest_requested_delivery_date"].date() == date(2026, 4, 5)
+    assert frame.iloc[0]["oldest_overdue_days"] == 25
+    assert frame.attrs["as_of_date"] == date(2026, 4, 30)
+    assert frame.attrs["quantity_basis"] == QuantityBasis.EACHES.value
+    assert "current source status" in frame.attrs["warning"]
+    assert "not a historical reconstruction" in frame.attrs["warning"]
+
+
+def test_backlog_breakdown_applies_dimensions_basis_and_allowlist(
+    service: AnalyticsService,
+) -> None:
+    filters = FilterSet(
+        date(2026, 4, 1),
+        date(2026, 4, 30),
+        warehouse_codes=("WH01",),
+    )
+
+    frame = service.backlog_by_dimension(filters, "route", QuantityBasis.CASE_EQUIVALENTS, limit=1)
+
+    assert frame["dimension_value"].tolist() == ["RT0001"]
+    assert frame.iloc[0]["overdue_ordered_quantity"] == 5
+    assert frame.attrs["quantity_basis"] == QuantityBasis.CASE_EQUIVALENTS.value
+    assert frame.attrs["dimension_label"] == "Route"
+    with pytest.raises(ValueError, match="Unsupported backlog dimension"):
+        service.backlog_by_dimension(filters, "arbitrary_sql")
+    with pytest.raises(ValueError, match="limit must be positive"):
+        service.backlog_by_dimension(filters, "route", limit=0)
 
 
 def test_inventory_discloses_filters_without_inventory_keys(

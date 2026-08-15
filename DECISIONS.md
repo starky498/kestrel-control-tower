@@ -5,7 +5,9 @@
 An eight-workspace Streamlit control tower over a reproducible SQLite → DuckDB semantic build and
 fingerprinted Parquet exports. It validates all 13 supplied tables and CSV parity, preserves native
 fact grains, defaults to FY 2026–27 Q1, and serves 24 versioned `1.0.0` metric contracts to the UI
-and governed question services.
+and governed question services. Ask Kestrel is rules-first, adds conservative spelling and
+session-scoped follow-ups, and can optionally use a pinned keyless local MiniLM model to map
+paraphrases into its finite intent catalogue; calculations remain behind typed metric services.
 
 The full-history freight client is retryable, resumable, and last-good protected. BazaarPulse uses
 allowed listing/detail pages, conservative automatic matching, reviewed YAML decisions,
@@ -38,9 +40,9 @@ delivery path.
 
 ## Boundaries and next production steps
 
-No graph database, universal flattened fact, unrestricted text-to-SQL, accounting-profit model,
-RBAC, or automated alert/approval workflow was added. City-centroid weather and a national holiday
-calendar cannot establish route/outlet conditions or closure.
+No graph database, universal flattened fact, cloud-LLM dependency, unrestricted text-to-SQL,
+accounting-profit model, RBAC, or automated alert/approval workflow was added. City-centroid weather
+and a national holiday calendar cannot establish route/outlet conditions or closure.
 
 With two more weeks I would add incremental orchestration, effective-dated customer/product
 assignments, role-scoped access, alert acknowledgement, secrets management, SLOs, and managed

@@ -3,15 +3,16 @@
 ## Supported operating model
 
 Kestrel is a local-first Python 3.11 application. Its operational source is read-only. Generated
-DuckDB, Parquet, external caches, operation logs, and UI-audit output live under `.kestrel/` and are
-excluded from Git. The supported evaluation paths are:
+DuckDB, Parquet, external caches, the optional local intent model, operation logs, and UI-audit
+output live under `.kestrel/` and are excluded from Git. The supported evaluation paths are:
 
 - a local virtual environment, using `make start` or version-pinned application dependency locks;
   and
 - Docker Compose, with the assignment pack mounted read-only and `.kestrel/` persisted.
 
-External sources are explicit refresh jobs. Streamlit does not call the freight API, BazaarPulse,
-Open-Meteo, Nager.Date, or Google Calendar while rendering.
+External sources are explicit refresh jobs. Passive Streamlit rendering and normal startup do not
+call the freight API, BazaarPulse, Open-Meteo, Nager.Date, Google Calendar, or a model host. The
+explicit **Install local language model** button is the only UI action that contacts the model host.
 
 ## 1. Prepare a clean checkout
 
@@ -47,7 +48,8 @@ Before installing or building, confirm that no supplied/generated artifacts are 
 
 ```bash
 git status --short
-git check-ignore data/source/data/kestrel_ops.db .env .kestrel/kestrel.duckdb
+git check-ignore data/source/data/kestrel_ops.db .env .kestrel/kestrel.duckdb \
+  .kestrel/models/all-MiniLM-L6-v2/onnx/model.onnx
 ```
 
 ## 2. Start locally
@@ -91,6 +93,45 @@ If `.kestrel/kestrel.duckdb` already exists and no source/configuration change r
 ```bash
 make run
 ```
+
+### Optional local semantic intent matcher
+
+The rules-first Ask Kestrel experience needs no AI key or model download. To add local paraphrase
+matching on a development machine, run:
+
+```bash
+make setup-local-nlp
+```
+
+Operators can trigger the same checksum-verified installer from the **Install local language
+model** button on the Ask Kestrel page.
+
+This target first ensures the local virtual environment is installed, then selects the pinned ONNX
+file for the host architecture, downloads it from the public model repository, and verifies its
+declared size and SHA-256. It follows `KESTREL_NLQ_MODEL_PATH` when set; otherwise it writes below
+the model directory in `KESTREL_RUNTIME_DIR`, normally
+`.kestrel/models/all-MiniLM-L6-v2/`. Common ARM64 and x86-64 hosts download approximately 23 MB of
+model data plus a small tokenizer/configuration; the portable fallback is approximately 46 MB.
+The default generated path is ignored and therefore is not included when the repository is cloned.
+Each user who wants paraphrase support installs their own copy.
+
+If a custom model path is inside the checkout, keep it under `.kestrel/` or add that exact directory
+to the checkout's uncommitted `.git/info/exclude`; do not add downloaded model artifacts to Git.
+The ONNX/tokenizer runtime is part of the pinned Python environment and used about 100 MB in the
+tested macOS virtual environment; installed size varies by platform.
+
+The download needs temporary network access but no API key, paid account, or shared credential.
+Inference is local. Exact rules retain precedence; the model can only suggest a finite configured
+intent and must pass confidence and ambiguity gates. Spelling repair and follow-up context are also
+local, and the resolved intent still executes parameterized governed metric services. There is no
+model-generated SQL, formula, filter, or answer.
+
+If the model is absent, incomplete, disabled with `KESTREL_NLQ_SEMANTIC_ENABLED=false`, or cannot
+load, Ask Kestrel continues in rules-only mode. `make start` deliberately does not depend on this
+target, so model hosting and network availability cannot block startup. Rerunning
+`make setup-local-nlp` reuses files that already match the manifest and safely replaces only an
+incomplete download. The standard container image likewise starts in rules-only mode and does not
+download a model during build or startup.
 
 ## 3. Baseline operational checks
 
@@ -244,7 +285,7 @@ git diff --check
 ```
 
 `make lint` runs Ruff and mypy. `make test` runs the deterministic pytest suite; the 15 August 2026
-release run passed all 123 tests. Generated external data is not required for unit tests.
+release run passed all 239 tests. Generated external data is not required for unit tests.
 
 ### Eight-workspace audit
 
@@ -263,8 +304,8 @@ time is recorded for diagnosis; the implemented threshold gate applies to each w
 
 The automated audit is not WCAG conformance evidence. Complete the manual checks in
 `docs/ACCESSIBILITY_PERFORMANCE.md` separately. The 15 August 2026 local release run passed all
-eight workspaces; initial render was 6,937.851 ms and its slowest measured page rerender was
-Executive Command Center at 2,593.651 ms, with no missing heading, exception/error, or unlabelled control. Refresh
+eight workspaces; initial render was 1,334.872 ms and its slowest measured page rerender was
+Executive Command Center at 421.756 ms, with no missing heading, exception/error, or unlabelled control. Refresh
 the ignored JSON report after any material change.
 
 ### Governed-question benchmark
@@ -278,13 +319,15 @@ PYTHONPATH=src .venv/bin/python scripts/benchmark_qa.py \
   --output .kestrel/qa-benchmark.json
 ```
 
-The eight cases verify expected answer status and, where applicable, metric, dimension, result limit,
-and a 5,000 ms per-question bound. The market and freight cases require their governed analytical
-snapshots; run the explicit refreshes first. The generated report is local evidence and is excluded
-from Git. Treat a missing optional snapshot as a failed benchmark precondition, not permission to
-weaken the expected answer contract.
+The baseline cases verify expected answer status and, where applicable, metric, dimension, result
+limit, spelling repair, timing cohort, and a 5,000 ms per-question bound. Market and freight cases
+require their governed analytical snapshots. If the optional model passes its manifest checksum
+validation, two additional local-semantic paraphrase cases run. The generated report is local
+evidence and is excluded from Git. Treat a missing optional snapshot as a failed benchmark
+precondition, not permission to weaken the expected answer contract.
 
-The 15 August 2026 release benchmark passed 8/8 cases; its slowest case was 1,064.450 ms.
+The 15 August 2026 release benchmark passed 19/19 applicable cases with the local model installed;
+its slowest case was 297.479 ms.
 
 ### Operation log
 
@@ -357,6 +400,8 @@ environment at Compose runtime and is not baked into the image.
 | BazaarPulse publication fails | Current listing incompleteness, unexpected parser failure, unsafe decision, or history collision | Correct the page/config/decision evidence and rerun; preceding current/history tables remain intact. The three known missing detail IDs remain structured warnings. Never weaken gates merely to force a match. |
 | Market API health says `unavailable` or an evidence route fails | Analytics DB is absent/unreadable | `/health` reports unavailable JSON when the file is absent. Run doctor/build and restart the API; it performs no recovery mutation itself. |
 | Streamlit page is empty | Optional source missing, filter denominator zero, or unsupported scope | Read the page disclosure/Trust Center, clear filters, and run only the missing explicit sync. Do not substitute zero. |
+| Local semantic matching is unavailable | Optional model was not installed, is incomplete, or fails manifest/runtime validation | Continue with rules-only Ask Kestrel. When network access is available, rerun `make setup-local-nlp`; do not add an API key or commit `.kestrel/models/`. |
+| A paraphrase or follow-up is refused | Confidence/margin gate, ambiguous context, or unsupported metric boundary | Rephrase with the metric, geography role, period, and grouping explicitly. Do not bypass the finite intent boundary or lower gates merely to force an answer. |
 | UI audit exceeds 15 seconds | Query/render regression or cold local environment | Inspect the per-page report, rerun once in a stable environment, then profile the named workspace; do not raise the threshold without documenting a requirement change. |
 | JSONL contains a malformed line | Interrupted/manual log alteration | Trust Center isolates the line. Preserve evidence, inspect filesystem stability, and let the next governed operation append normally. |
 | Container is unhealthy | First build still running, bad mount, source missing, or write permission | Check Compose logs, source/read-only mount, `.kestrel` write permission, then restart after correcting the host configuration. |

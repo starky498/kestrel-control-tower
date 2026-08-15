@@ -67,6 +67,7 @@ RETURN_DIMENSIONS: dict[str, tuple[str, str]] = {
     "warehouse": ("warehouse_code", "Warehouse"),
     "route": ("route_code", "Route"),
     "outlet": ("outlet_code", "Outlet"),
+    "channel": ("channel", "Channel"),
     "category": ("category", "Category"),
     "sku": ("sku_code", "SKU"),
     "reason": ("return_reason_code", "Return reason"),
@@ -82,6 +83,7 @@ DELIVERY_EXCEPTION_DIMENSIONS: dict[str, tuple[str, str]] = {
     "warehouse": ("warehouse_code", "Warehouse"),
     "warehouse_region": ("warehouse_region_name", "DC region"),
     "customer_region": ("customer_region_name", "Customer region"),
+    "outlet": ("outlet_code", "Outlet"),
     "channel": ("channel", "Channel"),
     "telematics_vendor": ("telematics_vendor", "Telematics vendor"),
     "promotion": ("promotion_code", "Recorded promotion code"),
@@ -99,6 +101,13 @@ COLD_CHAIN_DIMENSIONS: dict[str, tuple[str, str]] = {
     "order_source": ("source_system", "Order source"),
     "category": ("category", "Chilled category"),
     "month": ("date_trunc('month', delivery_date)::DATE", "Delivery month"),
+}
+
+_DATE_RANGE_SOURCES: dict[str, tuple[str, str]] = {
+    "requested_delivery": ("fct_order_service", "requested_delivery_date"),
+    "actual_delivery": ("fct_delivery", "delivery_date"),
+    "returns": ("fct_return_credit_note", "return_date"),
+    "inventory": ("fct_inventory_snapshot", "snapshot_date"),
 }
 
 
@@ -182,30 +191,38 @@ class AnalyticsService:
                 parameters.extend(values)
         return " AND ".join(conditions), parameters
 
-    def available_date_range(self) -> tuple[date, date]:
+    def available_date_range(
+        self, date_basis: str = "requested_delivery"
+    ) -> tuple[date, date]:
+        """Return the observed range for an allow-listed governed date basis."""
+
+        try:
+            table, date_column = _DATE_RANGE_SOURCES[date_basis]
+        except KeyError:
+            raise ValueError(f"Unsupported date basis: {date_basis}") from None
         with self._connect() as connection:
             minimum, maximum = connection.execute(
-                "SELECT min(requested_delivery_date), max(requested_delivery_date) "
-                "FROM fct_order_service"
+                f"SELECT min({date_column}), max({date_column}) FROM {table}"
             ).fetchone()
         return minimum, maximum
 
     def filter_options(self) -> dict[str, list[str]]:
         queries = {
-            "customer_regions": "customer_region_name",
-            "warehouse_regions": "warehouse_region_name",
-            "warehouse_codes": "warehouse_code",
-            "route_codes": "route_code",
-            "outlet_codes": "outlet_code",
-            "channels": "channel",
-            "promotion_codes": "promotion_code",
-            "order_sources": "source_system",
+            "customer_regions": ("fct_order_service", "customer_region_name"),
+            "warehouse_regions": ("fct_order_service", "warehouse_region_name"),
+            "warehouse_codes": ("fct_order_service", "warehouse_code"),
+            "route_codes": ("fct_order_service", "route_code"),
+            "outlet_codes": ("fct_order_service", "outlet_code"),
+            "channels": ("fct_order_service", "channel"),
+            "promotion_codes": ("fct_order_service", "promotion_code"),
+            "order_sources": ("fct_order_service", "source_system"),
+            "categories": ("fct_order_line", "category"),
         }
         options: dict[str, list[str]] = {}
         with self._connect() as connection:
-            for key, column in queries.items():
+            for key, (table, column) in queries.items():
                 rows = connection.execute(
-                    f"SELECT DISTINCT {column} FROM fct_order_service "
+                    f"SELECT DISTINCT {column} FROM {table} "
                     f"WHERE {column} IS NOT NULL ORDER BY {column}"
                 ).fetchall()
                 options[key] = [row[0] for row in rows]
@@ -527,6 +544,62 @@ class AnalyticsService:
         """
         with self._connect() as connection:
             return connection.execute(sql, parameters).fetchdf()
+
+    def backlog_by_dimension(
+        self,
+        filters: FilterSet,
+        dimension: str,
+        basis: QuantityBasis = QuantityBasis.EACHES,
+        *,
+        limit: int = 30,
+    ) -> pd.DataFrame:
+        """Rank the current overdue OPEN-order backlog at the selected as-of date.
+
+        This is intentionally a source-state snapshot, not a reconstruction of the order
+        status that existed historically on ``filters.end_date``.
+        """
+
+        if dimension not in ORDER_DIMENSIONS:
+            raise ValueError(f"Unsupported backlog dimension: {dimension}")
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        column, label = ORDER_DIMENSIONS[dimension]
+        suffix = "eaches" if basis == QuantityBasis.EACHES else "case_equivalents"
+        where, where_parameters = self._as_of_filter_sql(
+            filters, date_column="requested_delivery_date"
+        )
+        parameters: list[Any] = [filters.end_date, *where_parameters, limit]
+        sql = f"""
+            SELECT {column} AS dimension_value,
+                   count(*) AS overdue_orders,
+                   sum(ordered_{suffix}) AS overdue_ordered_quantity,
+                   min(requested_delivery_date) AS oldest_requested_delivery_date,
+                   date_diff(
+                       'day', min(requested_delivery_date), ?
+                   ) AS oldest_overdue_days
+            FROM fct_order_service
+            WHERE is_eligible_service_outlet
+              AND order_status = 'OPEN'
+              AND {column} IS NOT NULL
+              AND {where}
+            GROUP BY {column}
+            ORDER BY overdue_orders DESC, overdue_ordered_quantity DESC, dimension_value
+            LIMIT ?
+        """
+        with self._connect() as connection:
+            frame = connection.execute(sql, parameters).fetchdf()
+        frame.attrs.update(
+            {
+                "dimension_label": label,
+                "as_of_date": filters.end_date,
+                "quantity_basis": basis.value,
+                "warning": (
+                    "Backlog uses each order's current source status as observed now; it is "
+                    "not a historical reconstruction of status on the selected date."
+                ),
+            }
+        )
+        return frame
 
     def fulfilment_flow(
         self,
@@ -921,7 +994,11 @@ class AnalyticsService:
                    count(*) FILTER (
                        WHERE failure_reason_code IS NOT NULL
                          AND trim(failure_reason_code) <> ''
-                   ) AS recorded_failures
+                   ) AS recorded_failures,
+                   count(*) FILTER (
+                       WHERE failure_reason_code IS NOT NULL
+                         AND trim(failure_reason_code) <> ''
+                   ) / nullif(count(*), 0) AS recorded_failure_rate
             FROM fct_delivery
             WHERE is_eligible_service AND {column} IS NOT NULL AND {where}
             GROUP BY {column}

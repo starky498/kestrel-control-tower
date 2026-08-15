@@ -42,7 +42,7 @@ accessibility remains separate and is not implied by the automated result.
 | CON-02 | Hard | Scrape no site other than the supplied BazaarPulse experience. | Local mode reads the bundled site; HTTP mode is constrained to configured BazaarPulse listing pages. |
 | CON-03 | Quality | Treat BazaarPulse `robots.txt` as binding on a live site. | `/internal/` and `/admin/` are never requested; allowed HTTP traversal observes the crawl interval. |
 | CON-04 | Quality | Treat documentation as partial and profile the data before deciding formulas. | Known conflicts, grains, counts, parity, and assumptions are recorded and checked. |
-| CON-05 | Decision | Weather, holidays, freight, and competitor refreshes must not become hidden startup dependencies. | The core operational app opens from its warehouse without contacting an external endpoint. |
+| CON-05 | Decision | Weather, holidays, freight, competitor refreshes, and optional language-model installation must not become hidden startup dependencies. | The core operational app opens from its warehouse without contacting an external endpoint or downloading a model. |
 | CON-06 | Quality | Do not silently mutate supplied source values. | SQLite opens read-only; raw and normalized fields coexist; conflicts remain visible. |
 | CON-07 | Quality | Keep secrets and generated evidence outside Git. | `.env`, databases, Parquet, `.kestrel/`, logs, caches, and audit artifacts are ignored. |
 
@@ -56,7 +56,7 @@ accessibility remains separate and is not implied by the automated result.
 | UX-04 | Business | Provide Cold Chain & Inventory Risk analysis. | Excursions per 100 chilled deliveries, monthly severity and maximum-temperature views by warehouse/route/category, latest-snapshot near-expiry and batch evidence, associated returns, snapshot date, denominator, and warning evidence are visible. |
 | UX-05 | Business | Provide Commercial Leakage & Logistics Cost analysis. | Approved-credit and short-delivery booked-value exposures, recorded physical dispositions, PAID settled freight/case as primary, billed/pending/disputed evidence, DC/route rankings, carrier spend, freshness, ignored filters, and attribution boundaries are visible. |
 | UX-06 | Business | Provide Market & External Context analysis. | Current and source-dated governed competitor evidence, retailer/listing/pack fields, effective-dated Kestrel MRP, 100G/100ML normalization, match/history coverage, service-price attention, and gated weather/holiday panels are visible. |
-| UX-07 | Business + Quality | Provide Ask Kestrel. | A typed router extracts supported metric, period, quantity basis, grouping, rank, and filters; it calls governed services and never executes unrestricted generated SQL. |
+| UX-07 | Business + Quality | Provide Ask Kestrel. | A rules-first typed router extracts supported metric, period, quantity basis, grouping, rank, and filters; conservative spelling repair and session follow-ups remain allowlisted; an optional local MiniLM matcher may map paraphrases only to finite intents. Execution always calls governed services and never executes unrestricted generated SQL. |
 | UX-08 | Quality | Provide Trust Center. | Metric version/definition/status, critical source boundaries, analytical snapshot time, dimension coverage, external readiness/sync history, and a bounded recent operation-event table are available. The source fingerprint remains in the build output/Parquet manifest. |
 | UX-09 | Business | Distinguish customer region from origin/DC region. | Labels are explicit. An unqualified region question stops for clarification; explicit customer and DC geography produce separate governed results. |
 | UX-10 | Business + Decision | Use FY 2026–27 Q1, 2026-04-01 through 2026-06-30, as the labelled default analytical period. | The dates and fiscal-year label are visible; custom periods remain selectable. |
@@ -113,10 +113,10 @@ accessibility remains separate and is not implied by the automated result.
 | DATA-04 | Quality | Preserve external evidence across operational rebuilds. | Physical `external_sync_runs`/`ext_*` data and compatible external views are copied into staging; a physical-copy error aborts promotion. |
 | DATA-05 | Quality | Normalize mixed order-creation timestamps without changing KPI cohorts. | ERP/SFA/partner parsers preserve raw text, IST timestamp, and parse status; explicit `Z` converts UTC→IST; warehouse assertions check consistency; no KPI uses creation time. |
 | MET-01 | Quality | Maintain a machine- and human-readable versioned metric registry. | Exactly 24 current definitions carry version `1.0.0` plus formula, grain, dates, eligibility, numerator, denominator, unit, status, and warning. |
-| MET-02 | Quality | Keep computation behind a typed, allowlisted query boundary. | Dashboard and Ask use parameterized services; dimensions and intents are finite; no raw user SQL path exists. |
+| MET-02 | Quality | Keep computation behind a typed, allowlisted query boundary. | Dashboard and Ask use parameterized services; dimensions and intents are finite; the optional semantic model selects an intent but cannot supply SQL, filters, formulas, or answer text; no raw user SQL path exists. |
 | OBS-01 | Quality | Record governed operation events locally. | Doctor, validation, build, freight, context, and market append STARTED then SUCCEEDED/FAILED JSONL events with run ID, UTC timestamp, and duration. Successful confirmed cleanup removes prior logs and leaves its final SUCCEEDED event in the recreated log. |
 | OBS-02 | Quality | Redact sensitive structured fields. | Keys containing API key, password, secret, token, or credential are recursively replaced before log append; the UI displays a bounded recent result. |
-| REP-01 | Quality | Provide a clean-start workflow. | `make start` creates the environment, installs dependencies, checks configuration, validates, builds, collects local market data, and starts Streamlit when the supplied pack is in place. |
+| REP-01 | Quality | Provide a clean-start workflow. | `make start` creates the environment, installs dependencies, checks configuration, validates, builds, collects local market data, and starts Streamlit when the supplied pack is in place; it does not require or download the optional local NLP model. |
 | REP-02 | Quality | Provide repeatable dependency-version paths. | CI uses `requirements-dev.lock`; Docker uses `requirements.lock`; local pinned-lock commands and the unpinned interpreter/build-tool boundary are documented. |
 | DEP-01 | Quality | Provide a safe container workflow. | Python 3.11 image runs non-root, source bind is read-only, generated state is writable/persistent, port 8501 has a health check, and optional syncs remain explicit. |
 | CI-01 | Quality | Verify code quality and image construction on push and pull request. | GitHub Actions installs the pinned development application/tool set, runs Ruff, mypy, pytest, and builds the runtime image with read-only repository permission. |
@@ -156,6 +156,8 @@ than hard-coded answers.
 - No claim of profit, product margin, final cash, or complete loss.
 - No graph database; the value-chain diagram describes a relational semantic model.
 - No unrestricted text-to-SQL or generative answer path.
+- No required cloud LLM, shared API key, or committed model binary; the optional local model is a
+  finite-intent paraphrase matcher and rules-only operation remains supported.
 - No forced competitor match, mutable market API, or disallowed BazaarPulse traversal.
 - No invented OTIF tolerance to turn a data finding into a conventional target.
 - No route-level weather, outlet weather, state-specific closure, or causal context estimate.
@@ -184,6 +186,6 @@ The implementation is ready for submission only when all of the following eviden
 The command for item 6 uses `--expected-pages 8` and is documented in
 `docs/ACCESSIBILITY_PERFORMANCE.md`. The 15 August 2026 local release run passed exactly eight
 workspaces with the required headings, no reported errors/exceptions or unlabelled controls, and a
-slowest page rerender of 2,593.651 ms on Executive Command Center against the 15,000 ms gate. This
+slowest page rerender of 421.756 ms on Executive Command Center against the 15,000 ms gate. This
 is automated regression evidence, not WCAG conformance or a substitute for the manual checks in
 that document.
