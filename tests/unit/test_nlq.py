@@ -312,6 +312,7 @@ def test_otif_by_customer_region_uses_latest_complete_fiscal_quarter() -> None:
     assert answer.intent.period.start == date(2026, 4, 1)
     assert answer.intent.period.end == date(2026, 6, 30)
     assert "0%" in answer.warnings[0]
+    assert answer.summary == "Strict OTIF is 0.0% for every customer region shown."
     assert "strict_otif_rate" in answer.evidence[0].columns
 
 

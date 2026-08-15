@@ -1191,12 +1191,22 @@ class QuestionRouter:
         if intent.limit is not None:
             frame = frame.head(intent.limit)
         evidence = _frame_evidence("Strict OTIF breakdown", "fct_order_service", frame)
-        summary = (
-            "No OTIF groups were found."
-            if frame.empty
-            else f"Strict OTIF is {_format_percent(frame.iloc[0]['strict_otif_rate'])} "
-            f"for {frame.iloc[0].get('dimension_value', frame.iloc[0].get('month'))}."
-        )
+        if frame.empty:
+            summary = "No OTIF groups were found."
+        else:
+            rates = frame["strict_otif_rate"].dropna()
+            dimension_label = dimension.value.replace("_", " ")
+            if not rates.empty and rates.nunique() == 1:
+                summary = (
+                    f"Strict OTIF is {_format_percent(rates.iloc[0])} for every "
+                    f"{dimension_label} shown."
+                )
+            else:
+                group = frame.iloc[0].get("dimension_value", frame.iloc[0].get("month"))
+                summary = (
+                    f"The lowest strict OTIF is "
+                    f"{_format_percent(frame.iloc[0]['strict_otif_rate'])} for {group}."
+                )
         return self._base_answer(intent, summary, (evidence,), warnings=warnings)
 
     def _returns(self, intent: QuestionIntent) -> QuestionAnswer:
