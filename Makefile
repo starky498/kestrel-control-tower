@@ -1,38 +1,43 @@
 PYTHON ?= python3
 VENV := .venv
 BIN := $(VENV)/bin
+RUN_ENV := PYTHONPATH=$(CURDIR)/src
 
-.PHONY: setup doctor validate-data build sync-freight scrape-prices run test lint clean
+.PHONY: setup start prepare doctor validate-data build sync-freight scrape-prices run test lint clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
 	$(BIN)/python -m pip install --upgrade pip
-	$(BIN)/pip install -e ".[dev]"
+	$(BIN)/pip install ".[dev]"
+
+start: setup doctor validate-data build scrape-prices run
+
+prepare: doctor validate-data build scrape-prices
 
 doctor:
-	$(BIN)/kestrel doctor
+	$(RUN_ENV) $(BIN)/kestrel doctor
 
 validate-data:
-	$(BIN)/kestrel validate-data
+	$(RUN_ENV) $(BIN)/kestrel validate-data
 
 build:
-	$(BIN)/kestrel build
+	$(RUN_ENV) $(BIN)/kestrel build
 
 sync-freight:
-	$(BIN)/kestrel sync-freight
+	$(RUN_ENV) $(BIN)/kestrel sync-freight
 
 scrape-prices:
-	$(BIN)/kestrel scrape-prices
+	$(RUN_ENV) $(BIN)/kestrel scrape-prices
 
 run:
-	$(BIN)/streamlit run app.py
+	$(RUN_ENV) $(BIN)/streamlit run app.py
 
 test:
-	$(BIN)/pytest
+	$(RUN_ENV) $(BIN)/pytest
 
 lint:
-	$(BIN)/ruff check .
-	$(BIN)/mypy src
+	$(RUN_ENV) $(BIN)/ruff check .
+	$(RUN_ENV) $(BIN)/mypy src
 
 clean:
-	$(BIN)/kestrel clean-generated
+	$(RUN_ENV) $(BIN)/kestrel clean-generated
