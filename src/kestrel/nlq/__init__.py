@@ -54,6 +54,8 @@ def _inherit_filters(parsed: IntentFilters, selected: FilterSet) -> IntentFilter
         route_codes=parsed.route_codes or selected.route_codes,
         outlet_codes=parsed.outlet_codes or selected.outlet_codes,
         channels=parsed.channels or selected.channels,
+        promotion_codes=parsed.promotion_codes or selected.promotion_codes,
+        order_sources=parsed.order_sources or selected.order_sources,
         cities=parsed.cities,
         categories=parsed.categories,
     )
@@ -91,11 +93,12 @@ def _ui_payload(answer: QuestionAnswer) -> dict[str, object]:
 _DEFINITION_KEYS = {
     MetricKey.FILL_RATE: "fill_rate",
     MetricKey.STRICT_OTIF: "strict_otif",
-    MetricKey.RETURNS: "approved_credit_note_rate",
+    MetricKey.RETURNS: "approved_credit_note_value_inr",
     MetricKey.CHILLED_EXCURSIONS: "temperature_excursions_per_100",
-    MetricKey.LATE_ROUTES: "late_over_2h_rate",
+    MetricKey.LATE_ROUTES: "delivery_late_over_2h_rate",
     MetricKey.MARKET_PRICE_GAP: "competitor_price_gap",
-    MetricKey.FREIGHT_PER_CASE: "freight_cost_per_case",
+    MetricKey.FREIGHT_PER_CASE: "settled_freight_cost_per_case",
+    MetricKey.DISCONTINUED_SKUS: "orders_after_discontinuation",
 }
 
 

@@ -8,6 +8,7 @@ This keeps a failed refresh from destroying either the last queryable snapshot o
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -16,7 +17,13 @@ from typing import Any
 import duckdb
 import pandas as pd
 
-from kestrel.ingestion.bazaarpulse import Listing, ProductCandidate, ProductMatch
+from kestrel.ingestion.bazaarpulse import (
+    Listing,
+    ProductCandidate,
+    ProductMatch,
+    SourceDetailFailure,
+    SourcePriceObservation,
+)
 from kestrel.ingestion.context import HolidayCache, WeatherCache
 from kestrel.ingestion.freight import FreightInvoice, FreightSyncMetadata
 
@@ -209,15 +216,50 @@ def _assert_history_replay_is_identical(
         )
 
 
+def _assert_source_price_replay_is_identical(
+    connection: duckdb.DuckDBPyConnection,
+    incoming_relation: str,
+    history_table: str,
+) -> None:
+    """Reject source-date identity collisions while accepting exact rediscovery."""
+
+    differences = int(
+        connection.execute(
+            f"""
+            SELECT count(*)
+            FROM {incoming_relation} incoming
+            JOIN {history_table} history USING (source_price_observation_id)
+            WHERE incoming.listing_id IS DISTINCT FROM history.listing_id
+               OR incoming.city IS DISTINCT FROM history.city
+               OR incoming.retailer IS DISTINCT FROM history.retailer
+               OR incoming.raw_title IS DISTINCT FROM history.raw_title
+               OR incoming.category IS DISTINCT FROM history.category
+               OR incoming.pack_value IS DISTINCT FROM history.pack_value
+               OR incoming.pack_uom IS DISTINCT FROM history.pack_uom
+               OR incoming.observed_on IS DISTINCT FROM history.observed_on
+               OR incoming.price_inr IS DISTINCT FROM history.price_inr
+               OR incoming.source_path IS DISTINCT FROM history.source_path
+            """
+        ).fetchone()[0]
+    )
+    if differences:
+        raise ValueError(
+            "BazaarPulse source price observation identity was rediscovered with a different "
+            "payload; append-only source history was left unchanged"
+        )
+
+
 def store_bazaarpulse_snapshot(
     database_path: Path,
     listings: list[Listing],
     matches: list[ProductMatch],
     *,
+    source_price_observations: Sequence[SourcePriceObservation] = (),
+    source_detail_failures: Sequence[SourceDetailFailure] = (),
     started_at_utc: datetime | None = None,
     completed_at_utc: datetime | None = None,
 ) -> IntegrationStoreSummary:
-    """Publish current BazaarPulse rows and idempotently append their audit history."""
+    """Publish current rows, sync audit, and source-dated price history atomically."""
 
     if not listings:
         raise ValueError("Refusing to replace the last-good BazaarPulse snapshot with no rows")
@@ -227,10 +269,38 @@ def store_bazaarpulse_snapshot(
         raise ValueError("BazaarPulse snapshot contains duplicate listing IDs")
     if set(listing_ids) != set(match_ids) or len(match_ids) != len(set(match_ids)):
         raise ValueError("BazaarPulse matches must contain exactly one outcome per listing")
+    listing_by_id = {listing.listing_id: listing for listing in listings}
+    source_observation_ids = [
+        observation.source_price_observation_id
+        for observation in source_price_observations
+    ]
+    if len(source_observation_ids) != len(set(source_observation_ids)):
+        raise ValueError("BazaarPulse source price history contains duplicate listing/date rows")
+    for observation in source_price_observations:
+        listing = listing_by_id.get(observation.listing_id)
+        if listing is None:
+            raise ValueError(
+                "BazaarPulse source price history contains an unknown current listing ID"
+            )
+        if (
+            observation.city != listing.city
+            or observation.retailer.casefold() != listing.retailer.casefold()
+        ):
+            raise ValueError(
+                "BazaarPulse source price history identity disagrees with the current listing"
+            )
+    failure_ids = [failure.listing_id for failure in source_detail_failures]
+    if len(failure_ids) != len(set(failure_ids)):
+        raise ValueError("BazaarPulse source detail failures contain duplicate listing IDs")
+    if not set(failure_ids).issubset(listing_by_id):
+        raise ValueError("BazaarPulse source detail failures contain an unknown listing ID")
 
     started = started_at_utc or datetime.now(UTC)
     completed = completed_at_utc or datetime.now(UTC)
     observed_dates = [listing.last_seen for listing in listings if listing.last_seen]
+    observed_dates.extend(
+        observation.observed_on for observation in source_price_observations
+    )
     coverage_start = min(observed_dates, default=None)
     coverage_end = max(observed_dates, default=None)
     matched_count = sum(match.matched for match in matches)
@@ -273,11 +343,64 @@ def store_bazaarpulse_snapshot(
             }
         )
         match_records.append(record)
+    source_price_records = []
+    for observation in source_price_observations:
+        record = asdict(observation)
+        record.update(
+            {
+                "source_price_observation_id": (
+                    observation.source_price_observation_id
+                ),
+                "observed_on": observation.observed_on,
+                "first_collected_at_utc": completed,
+                "first_sync_id": sync_id,
+            }
+        )
+        source_price_records.append(record)
+    source_failure_records = []
+    for failure in source_detail_failures:
+        record = asdict(failure)
+        record.update({"collected_at_utc": completed, "sync_id": sync_id})
+        source_failure_records.append(record)
 
     connection = duckdb.connect(str(database_path))
     try:
         _register_frame(connection, "_bazaarpulse_listings", listing_records)
         _register_frame(connection, "_bazaarpulse_matches", match_records)
+        source_price_columns = [
+            "listing_id",
+            "city",
+            "retailer",
+            "raw_title",
+            "category",
+            "pack_value",
+            "pack_uom",
+            "observed_on",
+            "price_inr",
+            "source_path",
+            "source_price_observation_id",
+            "first_collected_at_utc",
+            "first_sync_id",
+        ]
+        connection.register(
+            "_bazaarpulse_source_prices",
+            pd.DataFrame.from_records(source_price_records, columns=source_price_columns),
+        )
+        source_failure_columns = [
+            "listing_id",
+            "source_path",
+            "failure_type",
+            "message",
+            "collected_at_utc",
+            "sync_id",
+        ]
+        connection.register(
+            "_bazaarpulse_source_failures",
+            pd.DataFrame.from_records(
+                source_failure_records,
+                columns=source_failure_columns,
+            ),
+        )
         connection.execute(
             """
             CREATE OR REPLACE TEMP VIEW _bazaarpulse_listings_typed AS
@@ -301,6 +424,40 @@ def store_bazaarpulse_snapshot(
                 cast(sync_id AS VARCHAR) AS sync_id,
                 cast(observation_id AS VARCHAR) AS observation_id
             FROM _bazaarpulse_listings
+            """
+        )
+        connection.execute(
+            """
+            CREATE OR REPLACE TEMP VIEW _bazaarpulse_source_failures_typed AS
+            SELECT
+                cast(listing_id AS VARCHAR) AS listing_id,
+                cast(source_path AS VARCHAR) AS source_path,
+                cast(failure_type AS VARCHAR) AS failure_type,
+                cast(message AS VARCHAR) AS message,
+                cast(collected_at_utc AS TIMESTAMPTZ) AS collected_at_utc,
+                cast(sync_id AS VARCHAR) AS sync_id
+            FROM _bazaarpulse_source_failures
+            """
+        )
+        connection.execute(
+            """
+            CREATE OR REPLACE TEMP VIEW _bazaarpulse_source_prices_typed AS
+            SELECT
+                cast(source_price_observation_id AS VARCHAR)
+                    AS source_price_observation_id,
+                cast(listing_id AS VARCHAR) AS listing_id,
+                cast(city AS VARCHAR) AS city,
+                cast(retailer AS VARCHAR) AS retailer,
+                cast(raw_title AS VARCHAR) AS raw_title,
+                cast(category AS VARCHAR) AS category,
+                cast(pack_value AS DOUBLE) AS pack_value,
+                cast(pack_uom AS VARCHAR) AS pack_uom,
+                cast(observed_on AS DATE) AS observed_on,
+                cast(price_inr AS DOUBLE) AS price_inr,
+                cast(source_path AS VARCHAR) AS source_path,
+                cast(first_collected_at_utc AS TIMESTAMPTZ) AS first_collected_at_utc,
+                cast(first_sync_id AS VARCHAR) AS first_sync_id
+            FROM _bazaarpulse_source_prices
             """
         )
         connection.execute(
@@ -349,6 +506,12 @@ def store_bazaarpulse_snapshot(
             SELECT * FROM _bazaarpulse_matches_typed WHERE FALSE
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ext_bazaarpulse_source_price_observation AS
+            SELECT * FROM _bazaarpulse_source_prices_typed WHERE FALSE
+            """
+        )
         if not listing_history_exists:
             _seed_bazaarpulse_history_from_legacy_current(
                 connection,
@@ -366,6 +529,11 @@ def store_bazaarpulse_snapshot(
             "_bazaarpulse_listings_typed",
             "ext_bazaarpulse_listing_history",
         )
+        _assert_source_price_replay_is_identical(
+            connection,
+            "_bazaarpulse_source_prices_typed",
+            "ext_bazaarpulse_source_price_observation",
+        )
         _assert_history_replay_is_identical(
             connection,
             "_bazaarpulse_matches_typed",
@@ -378,6 +546,17 @@ def store_bazaarpulse_snapshot(
             WHERE NOT EXISTS (
                 SELECT 1 FROM ext_bazaarpulse_listing_history history
                 WHERE history.observation_id = incoming.observation_id
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO ext_bazaarpulse_source_price_observation BY NAME
+            SELECT incoming.* FROM _bazaarpulse_source_prices_typed incoming
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ext_bazaarpulse_source_price_observation history
+                WHERE history.source_price_observation_id =
+                      incoming.source_price_observation_id
             )
             """
         )
@@ -401,6 +580,12 @@ def store_bazaarpulse_snapshot(
             """
             CREATE OR REPLACE TABLE ext_bazaarpulse_match_current AS
             SELECT * FROM _bazaarpulse_matches_typed
+            """
+        )
+        connection.execute(
+            """
+            CREATE OR REPLACE TABLE ext_bazaarpulse_source_detail_failure_current AS
+            SELECT * FROM _bazaarpulse_source_failures_typed
             """
         )
         connection.execute(
@@ -489,6 +674,150 @@ def store_bazaarpulse_snapshot(
             LEFT JOIN dim_product product ON product.product_id = match.product_id
             """
         )
+        product_columns = _table_columns(connection, "dim_product")
+        product_pack_value = (
+            "product.pack_size_value"
+            if "pack_size_value" in product_columns
+            else "NULL::DOUBLE"
+        )
+        product_pack_uom = (
+            "product.pack_size_uom"
+            if "pack_size_uom" in product_columns
+            else "NULL::VARCHAR"
+        )
+        has_price_history = _table_exists(connection, "raw_product_price_history")
+        if has_price_history:
+            price_history_fields = """
+                historical_price.price_history_id,
+                historical_price.effective_from AS mrp_effective_from,
+                historical_price.effective_to AS mrp_effective_to,
+                historical_price.mrp_inr AS historical_kestrel_mrp_inr,
+                historical_price.list_price_inr AS historical_kestrel_list_price_inr,
+            """
+            price_history_join = """
+                LEFT JOIN LATERAL (
+                    SELECT cast(price.price_history_id AS BIGINT) AS price_history_id,
+                           cast(price.effective_from AS DATE) AS effective_from,
+                           cast(price.effective_to AS DATE) AS effective_to,
+                           cast(price.mrp_inr AS DOUBLE) AS mrp_inr,
+                           cast(price.list_price_inr AS DOUBLE) AS list_price_inr
+                    FROM raw_product_price_history price
+                    WHERE price.product_id = match.product_id
+                      AND source.observed_on >= cast(price.effective_from AS DATE)
+                      AND (
+                          price.effective_to IS NULL
+                          OR source.observed_on <= cast(price.effective_to AS DATE)
+                      )
+                    ORDER BY cast(price.effective_from AS DATE) DESC,
+                             cast(price.price_history_id AS BIGINT) DESC
+                    LIMIT 1
+                ) historical_price ON TRUE
+            """
+        else:
+            price_history_fields = """
+                NULL::BIGINT AS price_history_id,
+                NULL::DATE AS mrp_effective_from,
+                NULL::DATE AS mrp_effective_to,
+                NULL::DOUBLE AS historical_kestrel_mrp_inr,
+                NULL::DOUBLE AS historical_kestrel_list_price_inr,
+            """
+            price_history_join = ""
+        connection.execute(
+            f"""
+            CREATE OR REPLACE VIEW vw_competitor_source_price_history AS
+            WITH enriched AS (
+                SELECT
+                    source.source_price_observation_id,
+                    source.listing_id,
+                    source.city,
+                    source.retailer,
+                    source.raw_title,
+                    source.category AS observed_category,
+                    source.pack_value AS observed_pack_value,
+                    source.pack_uom AS observed_pack_uom,
+                    source.observed_on,
+                    source.price_inr AS observed_price_inr,
+                    source.source_path,
+                    source.first_collected_at_utc,
+                    source.first_sync_id,
+                    match.status AS match_status,
+                    match.confidence AS match_confidence,
+                    match.runner_up_confidence,
+                    match.reason AS match_reason,
+                    match.product_id,
+                    match.sku_code,
+                    match.suggested_product_id,
+                    match.suggested_sku_code,
+                    match.provenance AS match_provenance,
+                    match.algorithm_status,
+                    match.algorithm_reason,
+                    match.decision_source,
+                    match.reviewer,
+                    match.reviewed_on,
+                    match.review_note,
+                    product.product_name,
+                    product.brand AS kestrel_brand,
+                    product.category AS kestrel_category,
+                    {product_pack_value} AS kestrel_pack_value,
+                    {product_pack_uom} AS kestrel_pack_uom,
+                    {price_history_fields}
+                    CASE upper(source.pack_uom)
+                        WHEN 'KG' THEN source.pack_value * 1000
+                        WHEN 'L' THEN source.pack_value * 1000
+                        WHEN 'G' THEN source.pack_value
+                        WHEN 'ML' THEN source.pack_value
+                    END AS observed_base_quantity,
+                    CASE upper({product_pack_uom})
+                        WHEN 'KG' THEN {product_pack_value} * 1000
+                        WHEN 'L' THEN {product_pack_value} * 1000
+                        WHEN 'G' THEN {product_pack_value}
+                        WHEN 'ML' THEN {product_pack_value}
+                    END AS kestrel_base_quantity,
+                    CASE
+                        WHEN upper(source.pack_uom) IN ('G', 'KG') THEN 'G'
+                        WHEN upper(source.pack_uom) IN ('ML', 'L') THEN 'ML'
+                    END AS observed_base_uom,
+                    CASE
+                        WHEN upper({product_pack_uom}) IN ('G', 'KG') THEN 'G'
+                        WHEN upper({product_pack_uom}) IN ('ML', 'L') THEN 'ML'
+                    END AS kestrel_base_uom
+                FROM ext_bazaarpulse_source_price_observation source
+                JOIN ext_bazaarpulse_match_current match USING (listing_id)
+                LEFT JOIN dim_product product ON product.product_id = match.product_id
+                {price_history_join}
+            ), comparable AS (
+                SELECT *,
+                       coalesce(
+                           observed_base_quantity > 0
+                           AND kestrel_base_quantity > 0
+                           AND observed_base_uom = kestrel_base_uom,
+                           FALSE
+                       ) AS pack_comparable
+                FROM enriched
+            )
+            SELECT *,
+                   CASE WHEN pack_comparable THEN '100 ' || observed_base_uom END
+                       AS unit_price_basis,
+                   CASE WHEN pack_comparable
+                        THEN observed_price_inr * 100.0 / observed_base_quantity END
+                       AS observed_unit_price_inr,
+                   CASE WHEN pack_comparable AND historical_kestrel_mrp_inr IS NOT NULL
+                        THEN historical_kestrel_mrp_inr * 100.0 / kestrel_base_quantity END
+                       AS historical_kestrel_mrp_unit_inr,
+                   CASE WHEN pack_comparable AND historical_kestrel_mrp_inr IS NOT NULL
+                        THEN historical_kestrel_mrp_inr * 100.0 / kestrel_base_quantity
+                           - observed_price_inr * 100.0 / observed_base_quantity END
+                       AS historical_unit_price_gap_inr,
+                   CASE WHEN pack_comparable AND historical_kestrel_mrp_inr IS NOT NULL
+                                  AND observed_price_inr > 0
+                        THEN 100.0 * (
+                            (historical_kestrel_mrp_inr / kestrel_base_quantity)
+                            / (observed_price_inr / observed_base_quantity) - 1
+                        ) END AS historical_mrp_premium_pct,
+                   historical_kestrel_mrp_inr IS NOT NULL AS mrp_history_available
+            FROM comparable
+            """
+        )
         connection.execute(
             """
             CREATE OR REPLACE VIEW vw_competitor_match_review_queue AS
@@ -515,6 +844,14 @@ def store_bazaarpulse_snapshot(
                 "manual_rejections": sum(
                     match.provenance == "manual_rejection" for match in matches
                 ),
+                "source_price_observations": len(source_price_observations),
+                "source_price_history_name": (
+                    "ext_bazaarpulse_source_price_observation"
+                ),
+                "source_detail_failures": [
+                    failure.to_dict() for failure in source_detail_failures
+                ],
+                "source_price_history_complete": not source_detail_failures,
             },
             sort_keys=True,
         )
@@ -525,9 +862,9 @@ def store_bazaarpulse_snapshot(
             [
                 sync_id,
                 "bazaarpulse",
-                "SUCCEEDED",
+                "SUCCEEDED_WITH_WARNINGS" if source_detail_failures else "SUCCEEDED",
                 len(listings),
-                True,
+                not source_detail_failures,
                 coverage_start,
                 coverage_end,
                 started,

@@ -184,7 +184,8 @@ def scrape_prices(
         source_description = settings.bazaarpulse_base_url
 
     try:
-        listings = collector.collect()
+        snapshot = collector.collect_snapshot()
+        listings = list(snapshot.listings)
     except Exception as error:
         typer.echo(
             f"BazaarPulse refresh failed; the last-good cache and warehouse snapshot were "
@@ -223,6 +224,8 @@ def scrape_prices(
         analytics_db,
         listings,
         matches,
+        source_price_observations=snapshot.source_price_observations,
+        source_detail_failures=snapshot.source_detail_failures,
         started_at_utc=started,
     )
     statuses = Counter(match.status for match in matches)
@@ -235,6 +238,16 @@ def scrape_prices(
         f"Observation coverage: {summary.coverage_start} to {summary.coverage_end}; "
         f"cache={settings.competitor_cache}"
     )
+    typer.echo(
+        "Source-dated detail-page prices: "
+        f"{len(snapshot.source_price_observations):,} observations"
+    )
+    if snapshot.source_detail_failures:
+        typer.echo(
+            "Detail-page collection warnings: "
+            f"{len(snapshot.source_detail_failures):,} structured failure(s); "
+            "see external sync details and the current failure table."
+        )
 
 
 @app.command("sync-freight")

@@ -1,15 +1,70 @@
 fill_rate:
   version: "1.0.0"
   title: Fill rate
-  formula: sum(delivered quantity) / sum(ordered quantity)
+  formula: sum(line-capped delivered quantity) / sum(ordered quantity)
   grain: Order line, aggregated as a ratio of sums
   date_basis: Requested delivery date
   eligible_population: DELIVERED and PARTIAL orders for currently active, non-deleted, non-test outlets
-  numerator: Delivered eaches or delivered case-equivalents, capped only at the presentation ratio
+  numerator: Delivered eaches or delivered case-equivalents capped to ordered quantity on every line
   denominator: Ordered eaches or ordered case-equivalents
   unit: percent
   status: verified
   warning: Eaches and case-equivalents are both available; eaches is the default.
+  allowed_dimensions: &service_dimensions [customer_region, warehouse_region, warehouse, route, outlet, channel, promotion, promotion_mechanic, order_source]
+  exclusions: &completed_service_exclusions [OPEN and CANCELLED orders, inactive deleted or test outlets, non-positive ordered quantity]
+  source_models: &service_models [fct_order_line, fct_order_service, dim_product, dim_outlet]
+  interpretation_limits: [A service-level ratio of sums, not an average of subgroup percentages or a causal diagnostic.]
+
+fill_rate_eaches:
+  version: "1.0.0"
+  title: Fill rate — eaches
+  formula: sum(line-capped delivered eaches) / sum(ordered eaches)
+  grain: Order line, aggregated as a ratio of sums
+  date_basis: Requested delivery date
+  eligible_population: DELIVERED and PARTIAL orders for currently active, non-deleted, non-test outlets
+  numerator: Delivered eaches capped to ordered eaches on every line
+  denominator: Ordered eaches
+  unit: percent
+  status: verified
+  warning: Displayed alongside case-equivalent fill because mixed case packs can make the two weighted rates differ.
+  allowed_dimensions: *service_dimensions
+  exclusions: *completed_service_exclusions
+  source_models: *service_models
+  interpretation_limits: [Delivery is capped to ordered eaches on every line so oversupply cannot offset another short line.]
+
+fill_rate_case_equivalents:
+  version: "1.0.0"
+  title: Fill rate — case-equivalents
+  formula: sum(line-capped delivered case-equivalents) / sum(ordered case-equivalents)
+  grain: Order line, aggregated as a ratio of sums using case_pack_at_order
+  date_basis: Requested delivery date
+  eligible_population: DELIVERED and PARTIAL orders for currently active, non-deleted, non-test outlets
+  numerator: Delivered case-equivalents capped to ordered case-equivalents on every line
+  denominator: Ordered case-equivalents
+  unit: percent
+  status: verified
+  warning: Uses case_pack_at_order, not the product's current case pack, and is displayed alongside eaches fill.
+  allowed_dimensions: *service_dimensions
+  exclusions: *completed_service_exclusions
+  source_models: *service_models
+  interpretation_limits: [Delivery is capped per line and conversion uses the historical case pack recorded on that order line.]
+
+short_delivery_value_exposure_inr:
+  version: "1.0.0"
+  title: Short-delivery booked-value exposure
+  formula: sum(line_value_inr * max(ordered_qty - delivered_qty, 0) / ordered_qty)
+  grain: Eligible completed order line, aggregated as a sum
+  date_basis: Requested delivery date
+  eligible_population: DELIVERED and PARTIAL orders for currently active, non-deleted, non-test outlets with positive ordered quantity
+  numerator: Booked line value associated proportionally with positive undelivered quantity
+  denominator: Not applicable
+  unit: INR
+  status: estimated
+  warning: This is booked-value exposure, not accounting loss, profit, cash leakage, or causal attribution.
+  allowed_dimensions: [customer_region, warehouse_region, warehouse, route, outlet, channel, promotion, promotion_mechanic, order_source, category, sku, short_reason]
+  exclusions: *completed_service_exclusions
+  source_models: [fct_order_line]
+  interpretation_limits: [A prioritisation exposure based on booked value, not realised loss, margin, profit, or cash.]
 
 strict_otif:
   version: "1.0.0"
@@ -23,6 +78,10 @@ strict_otif:
   unit: percent
   status: data_conflict
   warning: Every supplied order line is short-delivered, so strict in-full and strict OTIF are 0%.
+  allowed_dimensions: *service_dimensions
+  exclusions: *completed_service_exclusions
+  source_models: [fct_order_line, fct_order_service, fct_delivery, dim_outlet]
+  interpretation_limits: [Strict AND logic with no service tolerance; the supplied data degeneracy must remain visible.]
 
 on_time_rate:
   version: "1.0.0"
@@ -36,6 +95,10 @@ on_time_rate:
   unit: percent
   status: proxy
   warning: Stored delay_minutes conflicts with parsed timestamps on 67,211 supplied deliveries and is shown separately.
+  allowed_dimensions: *service_dimensions
+  exclusions: [Ineligible orders, missing or unparseable planned or actual arrival timestamps]
+  source_models: [fct_order_service, fct_delivery]
+  interpretation_limits: [Timestamp-derived timing is a service signal and does not identify responsibility for delay.]
 
 late_over_2h_rate:
   version: "1.0.0"
@@ -49,6 +112,10 @@ late_over_2h_rate:
   unit: percent
   status: proxy
   warning: This uses parsed timestamps; the stored delay field is retained as a conflicting source signal.
+  allowed_dimensions: *service_dimensions
+  exclusions: [Ineligible orders, missing or unparseable planned or actual arrival timestamps]
+  source_models: [fct_order_service, fct_delivery]
+  interpretation_limits: [The 120-minute threshold is a review rule, not a causal or contractual penalty finding.]
 
 temperature_excursions_per_100:
   version: "1.0.0"
@@ -62,6 +129,10 @@ temperature_excursions_per_100:
   unit: per_100
   status: proxy
   warning: The source flag is used because max_temp_celsius does not reliably explain the flag.
+  allowed_dimensions: [warehouse_region, warehouse, route, category, month, promotion, order_source]
+  exclusions: [Ineligible deliveries, deliveries without chilled SKUs]
+  source_models: [fct_delivery, fct_order_service, fct_order_line, dim_product]
+  interpretation_limits: [The source flag and descriptive temperature bands are not validated food-safety thresholds or proof of cause.]
 
 near_expiry_cases:
   version: "1.0.0"
@@ -75,6 +146,10 @@ near_expiry_cases:
   unit: cases
   status: verified
   warning: Inventory is weekly and current case packs are used upstream for on_hand_eaches.
+  allowed_dimensions: [warehouse_region, warehouse, category, sku, batch, snapshot_date]
+  exclusions: [Non-positive available stock, snapshots after the selected as-of date, expiry outside the configured window]
+  source_models: [fct_inventory_snapshot, dim_product, dim_warehouse]
+  interpretation_limits: [Weekly snapshot exposure has no customer route outlet promotion or order-source key.]
 
 approved_credit_note_rate:
   version: "1.0.0"
@@ -84,10 +159,31 @@ approved_credit_note_rate:
   date_basis: Return date for credit notes; requested delivery date for delivered value
   eligible_population: Approved credit notes and eligible completed-order dispatch estimates
   numerator: Approved credit_note_value_inr
-  denominator: Delivered quantity × booked unit price × (1 - booked line discount)
+  denominator: Per-line min(delivered, ordered) quantity × booked unit price × (1 - booked line discount)
   unit: percent
   status: estimated
   warning: This is measured gross commercial leakage, not accounting profit or cash collected.
+  allowed_dimensions: [customer_region, warehouse_region, warehouse, route, outlet, channel, category, sku, return_reason, disposition, credit_status, promotion, order_source]
+  exclusions: [Pending or rejected notes from the numerator, ineligible order lines from the denominator]
+  source_models: [fct_return_credit_note, fct_order_line]
+  interpretation_limits: [Separate return-date and requested-date facts are aggregated independently; this is not accounting profit or cash recovery.]
+
+approved_credit_note_value_inr:
+  version: "1.0.0"
+  title: Approved credit-note value
+  formula: sum(credit_note_value_inr where credit_note_status = APPROVED)
+  grain: Credit-note line, aggregated as a sum
+  date_basis: Return date
+  eligible_population: Credit-note lines with APPROVED workflow status
+  numerator: Approved credit_note_value_inr
+  denominator: Not applicable
+  unit: INR
+  status: verified
+  warning: Workflow approval does not prove cash settlement, inventory recovery, vendor reimbursement, or accounting loss.
+  allowed_dimensions: [customer_region, warehouse_region, warehouse, route, outlet, channel, category, sku, return_reason, disposition, promotion, order_source]
+  exclusions: [Pending and rejected credit-note lines]
+  source_models: [fct_return_credit_note]
+  interpretation_limits: [Approved value is the primary measured leakage component, not profit, loss, or collected cash.]
 
 freight_cost_per_case:
   version: "1.0.0"
@@ -101,6 +197,27 @@ freight_cost_per_case:
   unit: INR_per_case
   status: estimated
   warning: Freight has no order/delivery key; numerator and denominator are never joined invoice-to-delivery. Paid, pending, and disputed components remain separate.
+  allowed_dimensions: &freight_dimensions [warehouse_region, warehouse, route, invoice_status, carrier]
+  exclusions: &freight_exclusions [Driver-entered fuel cost, customer outlet channel promotion and order-source attribution, invoice-to-delivery joins]
+  source_models: &freight_models [ext_freight_invoice_current, fct_order_service, dim_warehouse, dim_route]
+  interpretation_limits: [DC and route are independent period lenses because most invoice warehouse-route pairs conflict with the route master; no carrier-to-case attribution.]
+
+settled_freight_cost_per_case:
+  version: "1.0.0"
+  title: Settled freight per delivered case-equivalent
+  formula: PAID billed freight in rupees / delivered case-equivalents
+  grain: Independently aggregated period × warehouse or period × route
+  date_basis: Freight service date and actual delivery date
+  eligible_population: PAID freight invoices and eligible completed-order delivered case-equivalents
+  numerator: API amount_paise / 100 plus detention_charge_paise / 100 for invoice_status = PAID
+  denominator: Delivered case-equivalents
+  unit: INR_per_case
+  status: estimated
+  warning: Freight has no order/delivery key; period × DC or route aggregates are compared without carrier-to-case attribution. Pending and disputed billed components remain visible separately.
+  allowed_dimensions: *freight_dimensions
+  exclusions: *freight_exclusions
+  source_models: *freight_models
+  interpretation_limits: [PAID is the primary settled view; pending and disputed invoices are secondary billed exposure and no cash-settlement timestamp is supplied.]
 
 competitor_price_gap:
   version: "1.0.0"
@@ -114,6 +231,27 @@ competitor_price_gap:
   unit: INR
   status: partial_coverage
   warning: BazaarPulse is refreshed weekly; results are latest observed, not live prices.
+  allowed_dimensions: &market_dimensions [city, retailer, category, sku, listing]
+  exclusions: &market_exclusions [Ambiguous low-confidence or rejected matches, unavailable listings, non-comparable packs]
+  source_models: &market_models [ext_bazaarpulse_listing_current, ext_bazaarpulse_match_current, ext_bazaarpulse_source_price_observation, dim_product, raw_product_price_history]
+  interpretation_limits: [Current gaps use current Kestrel MRP; historical evidence uses only effective-dated MRP and is not a live-price or causal claim.]
+
+competitor_match_coverage:
+  version: "1.0.0"
+  title: Governed competitor-match coverage
+  formula: current listings with final match_status = matched / all current listings
+  grain: Current BazaarPulse listing snapshot, aggregated by city or source-wide
+  date_basis: Latest governed BazaarPulse collection
+  eligible_population: All current collected listing cards, including unresolved outcomes
+  numerator: Current listings with a final governed matched outcome
+  denominator: All current collected listings
+  unit: percent
+  status: partial_coverage
+  warning: Coverage describes entity-resolution outcomes, not price availability, pack comparability, or SKU sales coverage.
+  allowed_dimensions: [city, retailer, match_status]
+  exclusions: [No current listing rows are excluded from the denominator]
+  source_models: [ext_bazaarpulse_listing_current, ext_bazaarpulse_match_current]
+  interpretation_limits: [A matched listing may still be unavailable or unusable for a price comparison; source-wide cards do not inherit operational order filters.]
 
 allocation_rate:
   version: "1.0.0"
@@ -127,6 +265,10 @@ allocation_rate:
   unit: percent
   status: verified
   warning: This describes the recorded allocation gate; it does not identify why stock was not allocated.
+  allowed_dimensions: *service_dimensions
+  exclusions: *completed_service_exclusions
+  source_models: *service_models
+  interpretation_limits: [Recorded allocation is an association and does not prove stock availability or warehouse cause.]
 
 post_allocation_fulfilment:
   version: "1.0.0"
@@ -140,6 +282,10 @@ post_allocation_fulfilment:
   unit: percent
   status: verified
   warning: This is a measured conversion after allocation, not causal attribution to a warehouse, route, or carrier.
+  allowed_dimensions: *service_dimensions
+  exclusions: [OPEN and CANCELLED orders, inactive deleted or test outlets, non-positive allocated quantity]
+  source_models: *service_models
+  interpretation_limits: [A conversion after allocation, not proof that logistics caused the remaining shortfall.]
 
 overdue_backlog_orders:
   version: "1.0.0"
@@ -153,6 +299,10 @@ overdue_backlog_orders:
   unit: orders
   status: verified
   warning: Backlog is a current source-state snapshot, not a historical reconstruction of order status at an earlier date.
+  allowed_dimensions: *service_dimensions
+  exclusions: [Completed or cancelled orders, inactive deleted or test outlets, requested dates after the reporting as-of date]
+  source_models: [fct_order_service, raw_orders, dim_outlet]
+  interpretation_limits: [Current status is evaluated at query time and must not be described as a historical backlog snapshot.]
 
 delivery_on_time_rate:
   version: "1.0.0"
@@ -166,6 +316,10 @@ delivery_on_time_rate:
   unit: percent
   status: proxy
   warning: This operational exception view is grouped by actual delivery date; the executive service KPI uses requested delivery date.
+  allowed_dimensions: &delivery_dimensions [customer_region, warehouse_region, warehouse, route, outlet, channel, telematics_vendor, promotion, order_source]
+  exclusions: &delivery_timing_exclusions [Ineligible deliveries, missing or unparseable planned or actual arrival timestamps]
+  source_models: &delivery_models [fct_delivery, fct_order_service]
+  interpretation_limits: [Actual-delivery cohort is operational evidence and differs from the requested-delivery service cohort.]
 
 delivery_late_over_2h_rate:
   version: "1.0.0"
@@ -179,6 +333,10 @@ delivery_late_over_2h_rate:
   unit: percent
   status: proxy
   warning: The threshold identifies exceptions for review and is not evidence of responsibility or cause.
+  allowed_dimensions: *delivery_dimensions
+  exclusions: *delivery_timing_exclusions
+  source_models: *delivery_models
+  interpretation_limits: [The 120-minute threshold is a descriptive triage rule, not proof of root cause or responsibility.]
 
 pod_coverage_rate:
   version: "1.0.0"
@@ -192,6 +350,10 @@ pod_coverage_rate:
   unit: percent
   status: verified
   warning: POD capture indicates recorded evidence coverage, not the quality or validity of the underlying document.
+  allowed_dimensions: *delivery_dimensions
+  exclusions: [Ineligible deliveries]
+  source_models: *delivery_models
+  interpretation_limits: [Recorded POD presence does not validate document contents, acceptance, or payment.]
 
 delay_source_conflict_rate:
   version: "1.0.0"
@@ -205,6 +367,10 @@ delay_source_conflict_rate:
   unit: percent
   status: data_conflict
   warning: This is a data-reconciliation signal; neither source is silently overwritten.
+  allowed_dimensions: *delivery_dimensions
+  exclusions: [Ineligible deliveries]
+  source_models: *delivery_models
+  interpretation_limits: [A disagreement flag identifies reconciliation work and does not select either timestamp or stored delay as universally correct.]
 
 recorded_failure_rate:
   version: "1.0.0"
@@ -218,3 +384,24 @@ recorded_failure_rate:
   unit: percent
   status: verified
   warning: A recorded reason is an associated source-system label and does not establish root cause or blame.
+  allowed_dimensions: [customer_region, warehouse_region, warehouse, route, outlet, channel, telematics_vendor, failure_reason, promotion, order_source]
+  exclusions: [Ineligible deliveries, empty failure reason codes from the numerator]
+  source_models: *delivery_models
+  interpretation_limits: [Recorded failure labels support a Pareto view but do not establish causal root cause or blame.]
+
+orders_after_discontinuation:
+  version: "1.0.0"
+  title: Order lines recorded after product discontinuation
+  formula: count(order lines where order_date > discontinued_date)
+  grain: Order line
+  date_basis: Order date
+  eligible_population: Order lines whose product has a non-null discontinuation date earlier than the order date
+  numerator: Qualifying order lines
+  denominator: Not applicable
+  unit: lines
+  status: verified
+  warning: This is a master-data/process exception and does not prove physical stock unavailability or improper fulfilment.
+  allowed_dimensions: [customer_region, warehouse_region, warehouse, route, outlet, channel, category, sku, promotion, order_source]
+  exclusions: [Products without a discontinuation date, orders on or before the discontinuation date]
+  source_models: [fct_order_line, dim_product]
+  interpretation_limits: [The exception uses current product discontinuation evidence and recorded order date; it is not a causal loss measure.]

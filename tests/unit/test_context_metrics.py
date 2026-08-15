@@ -29,7 +29,10 @@ def _database(path: Path, *, orders_per_group: int = 40) -> None:
                 has_chilled_product BOOLEAN,
                 temperature_excursion_flag BOOLEAN,
                 ordered_eaches DOUBLE,
-                delivered_eaches DOUBLE
+                delivered_eaches DOUBLE,
+                capped_delivered_eaches DOUBLE,
+                promotion_code VARCHAR,
+                source_system VARCHAR
             );
             CREATE TABLE ext_weather_daily_current (
                 warehouse_code VARCHAR,
@@ -102,10 +105,14 @@ def _database(path: Path, *, orders_per_group: int = 40) -> None:
                         rainy,
                         100.0,
                         90.0 if rainy else 98.0,
+                        90.0 if rainy else 98.0,
+                        "PRM0001" if order_id % 2 else "NO_PROMOTION",
+                        "SFA_MOBILE" if order_id % 2 else "ERP_WEB",
                     )
                 )
         connection.executemany(
-            "INSERT INTO fct_order_service VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO fct_order_service VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
 
@@ -156,3 +163,24 @@ def test_publication_gate_withholds_small_or_out_of_coverage_cohorts(tmp_path: P
     assert not outside.gate.publishable
     assert outside.frame.empty
     assert any("outside source coverage" in reason for reason in outside.gate.reasons)
+
+
+def test_context_associations_honor_promotion_and_order_source_scope(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "analytics.duckdb"
+    _database(database)
+    filters = FilterSet(
+        date(2026, 6, 1),
+        date(2026, 6, 2),
+        promotion_codes=("PRM0001",),
+        order_sources=("SFA_MOBILE",),
+    )
+
+    weather = _service(database, minimum=10).weather_delivery_association(filters)
+    holiday = _service(database, minimum=10).holiday_service_association(filters)
+
+    assert weather.gate.publishable
+    assert holiday.gate.publishable
+    assert weather.frame["order_count"].sum() == 40
+    assert holiday.frame["order_count"].sum() == 40

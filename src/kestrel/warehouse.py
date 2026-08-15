@@ -172,6 +172,21 @@ def _assert_models(connection: duckdb.DuckDBPyConnection) -> dict[str, int]:
             "Strict OTIF control failed: supplied data must retain a non-empty eligible "
             "population with zero strict in-full and OTIF orders."
         )
+
+    timestamp_status_violations = connection.execute(
+        """
+        SELECT count(*)
+        FROM fct_order_service
+        WHERE created_at_parse_status IS NULL
+           OR (created_at_parse_status LIKE 'PARSED_%' AND created_at_ist IS NULL)
+           OR (created_at_parse_status NOT LIKE 'PARSED_%' AND created_at_ist IS NOT NULL)
+        """
+    ).fetchone()[0]
+    if timestamp_status_violations:
+        raise RuntimeError(
+            "Order created_at normalization control failed: parse status and normalized "
+            f"Asia/Kolkata timestamp disagree on {timestamp_status_violations} orders."
+        )
     return counts
 
 

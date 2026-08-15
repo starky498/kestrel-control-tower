@@ -1,4 +1,43 @@
 CREATE TABLE fct_order_line AS
+WITH normalized_orders AS (
+    SELECT
+        o.*,
+        CASE o.source_system
+            WHEN 'ERP_WEB' THEN try_strptime(o.created_at, '%d/%m/%Y %H:%M')
+            WHEN 'SFA_MOBILE' THEN try_strptime(o.created_at, '%Y-%m-%d %H:%M:%S')
+            WHEN 'PARTNER_API' THEN timezone(
+                'Asia/Kolkata',
+                timezone(
+                    'UTC',
+                    try_strptime(o.created_at, '%Y-%m-%dT%H:%M:%SZ')
+                )
+            )
+        END AS created_at_ist
+    FROM raw_orders o
+), parsed_orders AS (
+    SELECT
+        normalized_orders.*,
+        CASE
+            WHEN created_at IS NULL OR trim(created_at) = '' THEN 'MISSING'
+            WHEN source_system NOT IN ('ERP_WEB', 'SFA_MOBILE', 'PARTNER_API')
+                THEN 'UNSUPPORTED_SOURCE'
+            WHEN created_at_ist IS NULL THEN 'PARSE_FAILED'
+            WHEN source_system = 'ERP_WEB' THEN 'PARSED_ERP_WEB_IST'
+            WHEN source_system = 'SFA_MOBILE' THEN 'PARSED_SFA_MOBILE_IST'
+            ELSE 'PARSED_PARTNER_API_UTC_TO_IST'
+        END AS created_at_parse_status
+    FROM normalized_orders
+), promotion_lookup AS (
+    -- Orders carry promo_code rather than promo_id. Collapse the source to the observed
+    -- code before joining so a malformed duplicate code can never fan out order lines.
+    SELECT
+        promo_code,
+        min(promo_name) AS promo_name,
+        min(mechanic) AS promotion_mechanic
+    FROM raw_promotions
+    WHERE promo_code IS NOT NULL AND trim(promo_code) <> ''
+    GROUP BY promo_code
+)
 SELECT
     CAST(ol.order_line_id AS BIGINT) AS order_line_id,
     CAST(ol.order_id AS BIGINT) AS order_id,
@@ -11,6 +50,13 @@ SELECT
     o.order_number,
     o.order_status,
     o.source_system,
+    o.created_at AS created_at_raw,
+    o.created_at_ist,
+    o.created_at_parse_status,
+    coalesce(nullif(trim(o.promo_code), ''), 'NO_PROMOTION') AS promotion_code,
+    coalesce(promotion.promo_name, 'No promotion') AS promotion_name,
+    coalesce(promotion.promotion_mechanic, 'No promotion') AS promotion_mechanic,
+    (nullif(trim(o.promo_code), '') IS NOT NULL) AS promotion_applied,
     o.channel,
     CAST(o.outlet_id AS BIGINT) AS outlet_id,
     outlet.outlet_code,
@@ -62,12 +108,19 @@ SELECT
          ELSE ol.allocated_qty END AS allocated_eaches,
     CASE WHEN ol.qty_uom = 'CASE' THEN ol.delivered_qty * ol.case_pack_at_order
          ELSE ol.delivered_qty END AS delivered_eaches,
+    CASE WHEN ol.qty_uom = 'CASE'
+         THEN least(ol.delivered_qty, ol.ordered_qty) * ol.case_pack_at_order
+         ELSE least(ol.delivered_qty, ol.ordered_qty) END AS capped_delivered_eaches,
     CASE WHEN ol.qty_uom = 'CASE' THEN ol.ordered_qty
          ELSE ol.ordered_qty / nullif(ol.case_pack_at_order, 0) END AS ordered_case_equivalents,
     CASE WHEN ol.qty_uom = 'CASE' THEN ol.allocated_qty
          ELSE ol.allocated_qty / nullif(ol.case_pack_at_order, 0) END AS allocated_case_equivalents,
     CASE WHEN ol.qty_uom = 'CASE' THEN ol.delivered_qty
          ELSE ol.delivered_qty / nullif(ol.case_pack_at_order, 0) END AS delivered_case_equivalents,
+    CASE WHEN ol.qty_uom = 'CASE' THEN least(ol.delivered_qty, ol.ordered_qty)
+         ELSE least(ol.delivered_qty, ol.ordered_qty)
+              / nullif(ol.case_pack_at_order, 0) END
+         AS capped_delivered_case_equivalents,
     greatest(
         CASE WHEN ol.qty_uom = 'CASE' THEN (ol.ordered_qty - ol.allocated_qty) * ol.case_pack_at_order
              ELSE ol.ordered_qty - ol.allocated_qty END,
@@ -109,6 +162,18 @@ SELECT
     CASE WHEN ol.ordered_qty > 0
          THEN ol.line_value_inr * least(ol.delivered_qty / ol.ordered_qty, 1.0)
          ELSE 0 END AS estimated_dispatch_value_inr,
+    CASE WHEN ol.ordered_qty > 0
+         THEN ol.line_value_inr * greatest(ol.ordered_qty - ol.delivered_qty, 0)
+              / ol.ordered_qty
+         ELSE 0 END AS short_delivery_value_exposure_inr,
+    CASE WHEN ol.ordered_qty > 0
+         THEN ol.line_value_inr * greatest(ol.ordered_qty - ol.allocated_qty, 0)
+              / ol.ordered_qty
+         ELSE 0 END AS allocation_short_value_exposure_inr,
+    CASE WHEN ol.ordered_qty > 0
+         THEN ol.line_value_inr * greatest(ol.allocated_qty - ol.delivered_qty, 0)
+              / ol.ordered_qty
+         ELSE 0 END AS post_allocation_short_value_exposure_inr,
     historical_price.mrp_inr AS historical_mrp_inr,
     historical_price.list_price_inr AS historical_list_price_inr,
     (product.discontinued_date IS NOT NULL
@@ -116,7 +181,7 @@ SELECT
     (o.order_status IN ('DELIVERED', 'PARTIAL')
         AND outlet.is_eligible_service_outlet) AS is_eligible_service
 FROM raw_order_lines ol
-JOIN raw_orders o ON o.order_id = ol.order_id
+JOIN parsed_orders o ON o.order_id = ol.order_id
 JOIN dim_date dd ON dd.calendar_date = CAST(o.order_date AS DATE)
 JOIN dim_outlet outlet ON outlet.outlet_id = o.outlet_id
 JOIN dim_product product ON product.product_id = ol.product_id
@@ -124,6 +189,7 @@ LEFT JOIN dim_region customer_region ON customer_region.region_id = o.region_id
 LEFT JOIN dim_warehouse warehouse ON warehouse.warehouse_id = o.warehouse_id
 LEFT JOIN dim_route route ON route.route_id = o.route_id
 LEFT JOIN dim_salesperson salesperson ON salesperson.salesperson_id = o.salesperson_id
+LEFT JOIN promotion_lookup promotion ON promotion.promo_code = o.promo_code
 LEFT JOIN raw_product_price_history historical_price
     ON historical_price.product_id = ol.product_id
    AND CAST(o.order_date AS DATE) >= CAST(historical_price.effective_from AS DATE)
@@ -155,6 +221,9 @@ SELECT
     CAST(p.planned_arrival_ts AS DATE) AS planned_delivery_date,
     CAST(p.actual_arrival_ts AS DATE) AS delivery_date,
     o.order_status,
+    o.source_system,
+    coalesce(nullif(trim(o.promo_code), ''), 'NO_PROMOTION') AS promotion_code,
+    (nullif(trim(o.promo_code), '') IS NOT NULL) AS promotion_applied,
     o.channel,
     CAST(o.outlet_id AS BIGINT) AS outlet_id,
     outlet.outlet_code,
@@ -229,6 +298,13 @@ WITH line_rollup AS (
         any_value(fiscal_quarter_label) AS fiscal_quarter_label,
         any_value(order_status) AS order_status,
         any_value(source_system) AS source_system,
+        any_value(created_at_raw) AS created_at_raw,
+        any_value(created_at_ist) AS created_at_ist,
+        any_value(created_at_parse_status) AS created_at_parse_status,
+        any_value(promotion_code) AS promotion_code,
+        any_value(promotion_name) AS promotion_name,
+        any_value(promotion_mechanic) AS promotion_mechanic,
+        any_value(promotion_applied) AS promotion_applied,
         any_value(channel) AS channel,
         any_value(outlet_id) AS outlet_id,
         any_value(outlet_code) AS outlet_code,
@@ -257,17 +333,23 @@ WITH line_rollup AS (
         sum(ordered_eaches) AS ordered_eaches,
         sum(allocated_eaches) AS allocated_eaches,
         sum(delivered_eaches) AS delivered_eaches,
+        sum(capped_delivered_eaches) AS capped_delivered_eaches,
         sum(allocation_short_eaches) AS allocation_short_eaches,
         sum(post_allocation_short_eaches) AS post_allocation_short_eaches,
         sum(short_eaches) AS short_eaches,
         sum(ordered_case_equivalents) AS ordered_case_equivalents,
         sum(allocated_case_equivalents) AS allocated_case_equivalents,
         sum(delivered_case_equivalents) AS delivered_case_equivalents,
+        sum(capped_delivered_case_equivalents) AS capped_delivered_case_equivalents,
         sum(allocation_short_case_equivalents) AS allocation_short_case_equivalents,
         sum(post_allocation_short_case_equivalents) AS post_allocation_short_case_equivalents,
         sum(short_case_equivalents) AS short_case_equivalents,
         sum(line_value_inr) AS line_value_inr,
         sum(estimated_dispatch_value_inr) AS estimated_dispatch_value_inr,
+        sum(short_delivery_value_exposure_inr) AS short_delivery_value_exposure_inr,
+        sum(allocation_short_value_exposure_inr) AS allocation_short_value_exposure_inr,
+        sum(post_allocation_short_value_exposure_inr)
+            AS post_allocation_short_value_exposure_inr,
         bool_and(strict_line_in_full) AS strict_in_full,
         bool_or(is_chilled) AS has_chilled_product,
         bool_or(ordered_after_discontinued) AS has_discontinued_product_order
@@ -277,9 +359,9 @@ WITH line_rollup AS (
 SELECT
     line_rollup.*,
     CASE WHEN ordered_eaches > 0
-         THEN least(delivered_eaches / ordered_eaches, 1.0) END AS fill_rate_eaches,
+         THEN capped_delivered_eaches / ordered_eaches END AS fill_rate_eaches,
     CASE WHEN ordered_case_equivalents > 0
-         THEN least(delivered_case_equivalents / ordered_case_equivalents, 1.0) END
+         THEN capped_delivered_case_equivalents / ordered_case_equivalents END
          AS fill_rate_case_equivalents,
     delivery.delivery_id,
     delivery.delivery_date,
@@ -309,6 +391,11 @@ SELECT
     CAST(r.order_line_id AS BIGINT) AS order_line_id,
     CAST(r.return_date AS DATE) AS return_date,
     line.channel,
+    line.source_system,
+    line.promotion_code,
+    line.promotion_name,
+    line.promotion_mechanic,
+    line.promotion_applied,
     CAST(r.outlet_id AS BIGINT) AS outlet_id,
     line.outlet_code,
     line.outlet_name,

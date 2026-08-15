@@ -43,6 +43,7 @@ _LISTING_PAGE_RE = re.compile(
     r"^/city/[^/]+/(?:page/\d+\.html|index(?:_p\d+)?\.html)$",
     re.IGNORECASE,
 )
+_PRODUCT_DETAIL_RE = re.compile(r"^/product/(?P<listing_id>[^/]+)\.html$", re.IGNORECASE)
 _PACK_RE = re.compile(
     r"(?P<value>\d+(?:[.,]\d+)?)\s*"
     r"(?P<uom>kilograms?|kgs?|kg|grams?|gms?|gm|g|millilit(?:er|re)s?|ml|"
@@ -159,12 +160,94 @@ class Listing:
 
 
 @dataclass(frozen=True, slots=True)
+class SourcePriceObservation:
+    """One dated shelf-price observation published on a BazaarPulse detail page.
+
+    This is source history at the business observation grain.  It is deliberately distinct
+    from the append-only scrape/sync audit history, where the same current listing can be seen
+    again on multiple collection runs.
+    """
+
+    listing_id: str
+    city: str
+    retailer: str
+    raw_title: str
+    category: str
+    pack_value: float | None
+    pack_uom: str | None
+    observed_on: date
+    price_inr: float
+    source_path: str
+
+    @property
+    def source_price_observation_id(self) -> str:
+        """Stable source identity: a listing has at most one quoted price per date."""
+
+        return f"bazaarpulse-source:{self.listing_id}:{self.observed_on.isoformat()}"
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-compatible record."""
+
+        record = asdict(self)
+        record["observed_on"] = self.observed_on.isoformat()
+        return record
+
+    @classmethod
+    def from_dict(cls, record: Mapping[str, object]) -> Self:
+        """Restore a source observation from the governed cache."""
+
+        values = dict(record)
+        values["observed_on"] = date.fromisoformat(str(values["observed_on"]))
+        return cls(**values)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
+class SourceDetailFailure:
+    """Structured evidence that one linked detail page could not be collected or parsed."""
+
+    listing_id: str
+    source_path: str
+    failure_type: Literal["missing_detail_page", "http_404", "parse_error"]
+    message: str
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, record: Mapping[str, object]) -> Self:
+        return cls(**dict(record))  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
+class BazaarPulseSnapshot:
+    """A complete current-listing crawl plus dated detail-page source history."""
+
+    listings: tuple[Listing, ...]
+    source_price_observations: tuple[SourcePriceObservation, ...]
+    source_detail_failures: tuple[SourceDetailFailure, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedListingPage:
     """Listings and crawlable pagination links found on one city page."""
 
     city: str
     listings: tuple[Listing, ...]
     pagination_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedProductDetail:
+    """Identity fields and dated price rows parsed from one product detail page."""
+
+    listing_id: str
+    city: str
+    retailer: str
+    raw_title: str
+    category: str
+    pack_value: float | None
+    pack_uom: str | None
+    source_price_observations: tuple[SourcePriceObservation, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,7 +490,11 @@ def _detail_path(card: Tag, current_path: str) -> str | None:
     if not anchor:
         return None
     resolved = _resolve_site_href(current_path, str(anchor.get("href")))
-    return resolved if resolved and is_allowed_path(resolved) else None
+    return (
+        resolved
+        if resolved and _PRODUCT_DETAIL_RE.fullmatch(resolved) and is_allowed_path(resolved)
+        else None
+    )
 
 
 def _listing_id(card: Tag, detail_path: str | None) -> str | None:
@@ -489,6 +576,148 @@ def parse_listing_page(
         city=city,
         listings=tuple(listings),
         pagination_paths=discover_pagination_paths(page_html, normalized_source),
+    )
+
+
+def _detail_metadata(soup: BeautifulSoup) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    for node in soup.select(".card p.muted"):
+        for part in node.get_text(" ", strip=True).split("·"):
+            label, separator, value = part.partition(":")
+            if separator and label.strip() and value.strip():
+                metadata[label.strip().casefold()] = _collapse_space(value)
+    return metadata
+
+
+def _detail_category(soup: BeautifulSoup) -> str:
+    breadcrumb = soup.select_one(".wrap > p.muted")
+    if not breadcrumb:
+        return "Unknown"
+    parts = [part.strip() for part in breadcrumb.get_text(" ", strip=True).split("/")]
+    return normalize_category(parts[2]) if len(parts) >= 3 and parts[2] else "Unknown"
+
+
+def _price_history_table(soup: BeautifulSoup) -> Tag | None:
+    for heading in soup.find_all(["h2", "h3", "h4"]):
+        if normalize_title(heading.get_text(" ", strip=True)) == "observed price history":
+            table = heading.find_next_sibling("table") or heading.find_next("table")
+            return table if isinstance(table, Tag) else None
+    return None
+
+
+def parse_product_detail(
+    page_html: str,
+    source_path: str,
+    *,
+    expected_listing: Listing | None = None,
+) -> ParsedProductDetail:
+    """Parse and validate weekly source history from one allowed product detail page."""
+
+    normalized_source = assert_allowed_path(source_path)
+    path_match = _PRODUCT_DETAIL_RE.fullmatch(normalized_source)
+    if not path_match:
+        raise ValueError(f"Not a BazaarPulse product detail path: {normalized_source}")
+    listing_id = path_match.group("listing_id")
+    soup = BeautifulSoup(page_html, "html.parser")
+    title = soup.select_one(".card h2")
+    if not title:
+        raise ValueError(f"BazaarPulse detail page has no product title: {normalized_source}")
+    raw_title = _collapse_space(title.get_text(" ", strip=True))
+    metadata = _detail_metadata(soup)
+    retailer = _collapse_space(metadata.get("retailer", ""))
+    city = normalize_city(metadata.get("city", ""))
+    category = _detail_category(soup)
+    pack_value, pack_uom = parse_pack(metadata.get("pack", ""))
+    if not retailer or not metadata.get("city"):
+        raise ValueError(
+            f"BazaarPulse detail page is missing retailer or city identity: {normalized_source}"
+        )
+
+    if expected_listing is not None:
+        identity_errors: list[str] = []
+        if listing_id != expected_listing.listing_id:
+            identity_errors.append("listing ID")
+        if city != expected_listing.city:
+            identity_errors.append("city")
+        if retailer.casefold() != expected_listing.retailer.casefold():
+            identity_errors.append("retailer")
+        if normalize_title(raw_title) != expected_listing.normalized_title:
+            identity_errors.append("title")
+        expected_pack = _base_pack(expected_listing.pack_value, expected_listing.pack_uom)
+        detail_pack = _base_pack(pack_value, pack_uom)
+        if expected_pack is not None and detail_pack is not None and expected_pack != detail_pack:
+            identity_errors.append("pack")
+        if identity_errors:
+            raise ValueError(
+                "BazaarPulse detail identity disagrees with its listing card "
+                f"({', '.join(identity_errors)}): {normalized_source}"
+            )
+
+    history_table = _price_history_table(soup)
+    if history_table is None:
+        raise ValueError(
+            f"BazaarPulse detail page has no observed-price history table: {normalized_source}"
+        )
+    rows = history_table.find_all("tr")
+    if not rows:
+        raise ValueError(f"BazaarPulse price-history table is empty: {normalized_source}")
+    headers = [
+        normalize_title(cell.get_text(" ", strip=True))
+        for cell in rows[0].find_all(["th", "td"])
+    ]
+    try:
+        observed_index = headers.index("observed on")
+        price_index = headers.index("price")
+    except ValueError as error:
+        raise ValueError(
+            f"BazaarPulse price-history headers are unsupported: {normalized_source}"
+        ) from error
+
+    by_date: dict[date, SourcePriceObservation] = {}
+    for row in rows[1:]:
+        cells = row.find_all("td")
+        if not cells:
+            continue
+        if max(observed_index, price_index) >= len(cells):
+            raise ValueError(f"Malformed BazaarPulse price-history row: {normalized_source}")
+        try:
+            observed_on = date.fromisoformat(cells[observed_index].get_text(" ", strip=True))
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid BazaarPulse observation date: {normalized_source}"
+            ) from error
+        price_inr = _parse_money(cells[price_index].get_text(" ", strip=True))
+        if price_inr is None or price_inr <= 0:
+            raise ValueError(f"Invalid BazaarPulse observed price: {normalized_source}")
+        observation = SourcePriceObservation(
+            listing_id=listing_id,
+            city=city,
+            retailer=retailer,
+            raw_title=raw_title,
+            category=category,
+            pack_value=pack_value,
+            pack_uom=pack_uom,
+            observed_on=observed_on,
+            price_inr=price_inr,
+            source_path=normalized_source,
+        )
+        existing = by_date.get(observed_on)
+        if existing is not None and existing != observation:
+            raise ValueError(
+                "BazaarPulse detail page contains conflicting prices for the same listing/date: "
+                f"{normalized_source} {observed_on}"
+            )
+        by_date[observed_on] = observation
+
+    return ParsedProductDetail(
+        listing_id=listing_id,
+        city=city,
+        retailer=retailer,
+        raw_title=raw_title,
+        category=category,
+        pack_value=pack_value,
+        pack_uom=pack_uom,
+        source_price_observations=tuple(by_date[item] for item in sorted(by_date)),
     )
 
 
@@ -583,11 +812,13 @@ def deduplicate_listings(listings: Iterable[Listing]) -> list[Listing]:
 
 @dataclass(slots=True)
 class BazaarPulseCollector:
-    """Traverse city pagination and optionally persist an atomic last-good cache."""
+    """Traverse allowed city/detail pages and optionally persist a last-good cache."""
 
     source: PageSource
     cache_path: Path | None = None
     max_pages: int = 500
+    max_detail_pages: int = 2_000
+    max_detail_failures: int = 25
 
     @classmethod
     def from_local(
@@ -596,11 +827,15 @@ class BazaarPulseCollector:
         *,
         cache_path: str | Path | None = None,
         max_pages: int = 500,
+        max_detail_pages: int = 2_000,
+        max_detail_failures: int = 25,
     ) -> Self:
         return cls(
             source=LocalSiteSource(Path(site_root)),
             cache_path=Path(cache_path) if cache_path else None,
             max_pages=max_pages,
+            max_detail_pages=max_detail_pages,
+            max_detail_failures=max_detail_failures,
         )
 
     @classmethod
@@ -611,6 +846,8 @@ class BazaarPulseCollector:
         crawl_delay_seconds: float = 1.0,
         cache_path: str | Path | None = None,
         max_pages: int = 500,
+        max_detail_pages: int = 2_000,
+        max_detail_failures: int = 25,
         client: httpx.Client | None = None,
     ) -> Self:
         return cls(
@@ -621,9 +858,11 @@ class BazaarPulseCollector:
             ),
             cache_path=Path(cache_path) if cache_path else None,
             max_pages=max_pages,
+            max_detail_pages=max_detail_pages,
+            max_detail_failures=max_detail_failures,
         )
 
-    def collect(self, entry_paths: Sequence[str] = DEFAULT_ENTRY_PATHS) -> list[Listing]:
+    def _collect_listings(self, entry_paths: Sequence[str]) -> list[Listing]:
         queue = deque(assert_allowed_path(path) for path in entry_paths)
         queued = set(queue)
         visited: set[str] = set()
@@ -645,23 +884,104 @@ class BazaarPulseCollector:
                     queue.append(next_path)
                     queued.add(next_path)
 
-        result = deduplicate_listings(collected)
+        return deduplicate_listings(collected)
+
+    def collect(self, entry_paths: Sequence[str] = DEFAULT_ENTRY_PATHS) -> list[Listing]:
+        """Collect current listing pages only (the backward-compatible fast path)."""
+
+        result = self._collect_listings(entry_paths)
         if self.cache_path:
             write_listings_cache(self.cache_path, result)
         return result
 
+    def collect_snapshot(
+        self,
+        entry_paths: Sequence[str] = DEFAULT_ENTRY_PATHS,
+    ) -> BazaarPulseSnapshot:
+        """Collect current listings and all linked, allowed detail-page source history."""
 
-def write_listings_cache(path: str | Path, listings: Sequence[Listing]) -> None:
-    """Atomically replace the JSON cache so a failed refresh preserves last-good data."""
+        listings = self._collect_listings(entry_paths)
+        detail_listings = [listing for listing in listings if listing.detail_path]
+        if len(detail_listings) > self.max_detail_pages:
+            raise CollectionLimitError(
+                "BazaarPulse detail crawl exceeded the "
+                f"{self.max_detail_pages}-page safety limit"
+            )
+        observations: list[SourcePriceObservation] = []
+        failures: list[SourceDetailFailure] = []
+        for listing in detail_listings:
+            assert listing.detail_path is not None
+            try:
+                detail_html = self.source.read_text(listing.detail_path)
+                parsed = parse_product_detail(
+                    detail_html,
+                    listing.detail_path,
+                    expected_listing=listing,
+                )
+            except FileNotFoundError:
+                failures.append(
+                    SourceDetailFailure(
+                        listing_id=listing.listing_id,
+                        source_path=listing.detail_path,
+                        failure_type="missing_detail_page",
+                        message="Linked product detail page is absent from the supplied site.",
+                    )
+                )
+                if len(failures) > self.max_detail_failures:
+                    raise CollectionLimitError(
+                        "BazaarPulse detail failures exceeded the "
+                        f"{self.max_detail_failures}-page safety limit; latest source_path="
+                        f"{listing.detail_path}"
+                    ) from None
+                continue
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code != 404:
+                    raise
+                failures.append(
+                    SourceDetailFailure(
+                        listing_id=listing.listing_id,
+                        source_path=listing.detail_path,
+                        failure_type="http_404",
+                        message="Linked product detail page returned HTTP 404.",
+                    )
+                )
+                if len(failures) > self.max_detail_failures:
+                    raise CollectionLimitError(
+                        "BazaarPulse detail failures exceeded the "
+                        f"{self.max_detail_failures}-page safety limit; latest source_path="
+                        f"{listing.detail_path}"
+                    ) from error
+                continue
+            except ValueError as error:
+                failures.append(
+                    SourceDetailFailure(
+                        listing_id=listing.listing_id,
+                        source_path=listing.detail_path,
+                        failure_type="parse_error",
+                        message=str(error),
+                    )
+                )
+                if len(failures) > self.max_detail_failures:
+                    raise CollectionLimitError(
+                        "BazaarPulse detail failures exceeded the "
+                        f"{self.max_detail_failures}-page safety limit; latest source_path="
+                        f"{listing.detail_path}; parser_error={error}"
+                    ) from error
+                continue
+            observations.extend(parsed.source_price_observations)
+        snapshot = BazaarPulseSnapshot(
+            tuple(listings),
+            tuple(observations),
+            tuple(failures),
+        )
+        if self.cache_path:
+            write_bazaarpulse_cache(self.cache_path, snapshot)
+        return snapshot
 
+
+def _write_json_atomically(path: str | Path, payload: Mapping[str, object]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "schema_version": 1,
-        "collected_at_utc": datetime.now(UTC).isoformat(),
-        "count": len(listings),
-        "listings": [listing.to_dict() for listing in listings],
-    }
     temporary_name: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -683,16 +1003,73 @@ def write_listings_cache(path: str | Path, listings: Sequence[Listing]) -> None:
             os.unlink(temporary_name)
 
 
+def write_listings_cache(path: str | Path, listings: Sequence[Listing]) -> None:
+    """Atomically replace the JSON cache so a failed refresh preserves last-good data."""
+
+    payload = {
+        "schema_version": 1,
+        "collected_at_utc": datetime.now(UTC).isoformat(),
+        "count": len(listings),
+        "listings": [listing.to_dict() for listing in listings],
+    }
+    _write_json_atomically(path, payload)
+
+
+def write_bazaarpulse_cache(
+    path: str | Path,
+    snapshot: BazaarPulseSnapshot,
+) -> None:
+    """Atomically cache both current listings and source-dated price history."""
+
+    payload = {
+        "schema_version": 2,
+        "collected_at_utc": datetime.now(UTC).isoformat(),
+        "count": len(snapshot.listings),
+        "listing_count": len(snapshot.listings),
+        "source_price_observation_count": len(snapshot.source_price_observations),
+        "source_detail_failure_count": len(snapshot.source_detail_failures),
+        "listings": [listing.to_dict() for listing in snapshot.listings],
+        "source_price_observations": [
+            observation.to_dict() for observation in snapshot.source_price_observations
+        ],
+        "source_detail_failures": [
+            failure.to_dict() for failure in snapshot.source_detail_failures
+        ],
+    }
+    _write_json_atomically(path, payload)
+
+
+def read_bazaarpulse_cache(path: str | Path) -> BazaarPulseSnapshot:
+    """Read a full cache, accepting legacy listing-only schema version 1."""
+
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    schema_version = payload.get("schema_version")
+    if schema_version not in (1, 2):
+        raise ValueError("Unsupported BazaarPulse cache schema")
+    listing_records = payload.get("listings")
+    if not isinstance(listing_records, list):
+        raise ValueError("BazaarPulse cache is missing its listings array")
+    source_records = payload.get("source_price_observations", [])
+    if not isinstance(source_records, list):
+        raise ValueError("BazaarPulse cache has invalid source price observations")
+    failure_records = payload.get("source_detail_failures", [])
+    if not isinstance(failure_records, list):
+        raise ValueError("BazaarPulse cache has invalid source detail failures")
+    return BazaarPulseSnapshot(
+        listings=tuple(Listing.from_dict(record) for record in listing_records),
+        source_price_observations=tuple(
+            SourcePriceObservation.from_dict(record) for record in source_records
+        ),
+        source_detail_failures=tuple(
+            SourceDetailFailure.from_dict(record) for record in failure_records
+        ),
+    )
+
+
 def read_listings_cache(path: str | Path) -> list[Listing]:
     """Read a cache created by :func:`write_listings_cache`."""
 
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if payload.get("schema_version") != 1:
-        raise ValueError("Unsupported BazaarPulse cache schema")
-    records = payload.get("listings")
-    if not isinstance(records, list):
-        raise ValueError("BazaarPulse cache is missing its listings array")
-    return [Listing.from_dict(record) for record in records]
+    return list(read_bazaarpulse_cache(path).listings)
 
 
 def _token_similarity(left: str, right: str) -> float:

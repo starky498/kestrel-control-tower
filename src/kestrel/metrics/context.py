@@ -122,6 +122,8 @@ class ContextAnalyticsService:
             ("route_code", filters.route_codes),
             ("outlet_code", filters.outlet_codes),
             ("channel", filters.channels),
+            ("promotion_code", filters.promotion_codes),
+            ("source_system", filters.order_sources),
         )
         conditions = [f"{prefix}.{date_column} BETWEEN ? AND ?"]
         parameters: list[Any] = [filters.start_date, filters.end_date]
@@ -327,8 +329,8 @@ class ContextAnalyticsService:
                              AND temperature_excursion_flag IS NOT NULL
                        ), 0) AS observed_temperature_excursion_rate,
                        sum(ordered_eaches) AS ordered_eaches,
-                       sum(delivered_eaches) AS delivered_eaches,
-                       sum(delivered_eaches) / nullif(sum(ordered_eaches), 0)
+                       sum(capped_delivered_eaches) AS delivered_eaches,
+                       sum(capped_delivered_eaches) / nullif(sum(ordered_eaches), 0)
                            AS observed_fill_rate_eaches
                 FROM associated
                 GROUP BY context_group
@@ -394,8 +396,8 @@ class ContextAnalyticsService:
                              AND temperature_excursion_flag IS NOT NULL
                        ), 0) AS observed_temperature_excursion_rate,
                        sum(ordered_eaches) AS ordered_eaches,
-                       sum(delivered_eaches) AS delivered_eaches,
-                       sum(delivered_eaches) / nullif(sum(ordered_eaches), 0)
+                       sum(capped_delivered_eaches) AS delivered_eaches,
+                       sum(capped_delivered_eaches) / nullif(sum(ordered_eaches), 0)
                            AS observed_fill_rate_eaches
                 FROM associated
                 GROUP BY context_group

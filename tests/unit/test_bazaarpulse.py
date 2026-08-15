@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -8,6 +9,7 @@ import pytest
 
 from kestrel.ingestion.bazaarpulse import (
     BazaarPulseCollector,
+    CollectionLimitError,
     DisallowedPathError,
     HttpSiteSource,
     Listing,
@@ -17,6 +19,8 @@ from kestrel.ingestion.bazaarpulse import (
     match_listing_to_products,
     normalize_title,
     parse_listing_page,
+    parse_product_detail,
+    read_bazaarpulse_cache,
     read_listings_cache,
 )
 
@@ -45,6 +49,20 @@ INDEX_PAGE_HTML = """
     <div class="muted">Last seen: 2026-06-14</div>
   </div>
   <p class="pager"><b>1</b> <a href="/city/bengaluru/index.html?p=2">2</a></p>
+</div></body></html>
+"""
+
+DETAIL_PAGE_HTML = """
+<!doctype html><html><body><div class="wrap">
+  <p class="muted">Home / Mumbai / Beverages</p>
+  <div class="card"><h2>Combo KESTREL SEL. JUICE 200ML (New)</h2>
+    <p class="muted">Retailer: FreshCart &middot; City: Mumbai &middot; Pack: 200 ml</p>
+    <h3>Observed price history</h3>
+    <table><tr><th>Observed on</th><th>Price</th></tr>
+      <tr><td>2026-06-20</td><td>&#8377;49.50</td></tr>
+      <tr><td>2026-06-27</td><td>Rs. 48.00</td></tr>
+    </table>
+  </div>
 </div></body></html>
 """
 
@@ -150,6 +168,120 @@ def test_local_collector_follows_pages_deduplicates_and_writes_atomic_cache(
     payload = json.loads(cache_path.read_text(encoding="utf-8"))
     assert payload["count"] == 1
     assert not list(cache_path.parent.glob(".bazaarpulse.json.*.tmp"))
+
+
+def test_parses_product_detail_source_history_with_listing_identity() -> None:
+    listing = parse_listing_page(
+        NUMBERED_PAGE_HTML,
+        "/city/mumbai/page/1.html",
+    ).listings[0]
+
+    detail = parse_product_detail(
+        DETAIL_PAGE_HTML,
+        "/product/7.html",
+        expected_listing=listing,
+    )
+
+    assert detail.listing_id == "7"
+    assert detail.city == "Mumbai"
+    assert detail.retailer == "FreshCart"
+    assert (detail.pack_value, detail.pack_uom) == (200.0, "ML")
+    assert [item.observed_on for item in detail.source_price_observations] == [
+        date(2026, 6, 20),
+        date(2026, 6, 27),
+    ]
+    assert [item.price_inr for item in detail.source_price_observations] == [49.5, 48.0]
+    assert detail.source_price_observations[0].source_price_observation_id == (
+        "bazaarpulse-source:7:2026-06-20"
+    )
+
+
+def test_snapshot_crawls_allowed_details_and_atomically_caches_both_grains(
+    tmp_path: Path,
+) -> None:
+    site_root = tmp_path / "site"
+    city_page = site_root / "city" / "mumbai" / "page" / "1.html"
+    city_page.parent.mkdir(parents=True)
+    city_page.write_text(
+        NUMBERED_PAGE_HTML.replace(
+            '<p class="pager"><b>1</b> <a href="/city/mumbai/page/2.html">2</a></p>',
+            "",
+        ),
+        encoding="utf-8",
+    )
+    detail_page = site_root / "product" / "7.html"
+    detail_page.parent.mkdir()
+    detail_page.write_text(DETAIL_PAGE_HTML, encoding="utf-8")
+    cache_path = tmp_path / "cache" / "bazaarpulse.json"
+
+    snapshot = BazaarPulseCollector.from_local(
+        site_root,
+        cache_path=cache_path,
+    ).collect_snapshot(["/city/mumbai/page/1.html"])
+
+    assert len(snapshot.listings) == 1
+    assert len(snapshot.source_price_observations) == 2
+    assert read_bazaarpulse_cache(cache_path) == snapshot
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+    assert payload["source_price_observation_count"] == 2
+
+
+def test_detail_parse_failure_identifies_path_and_preserves_last_good_cache(
+    tmp_path: Path,
+) -> None:
+    site_root = tmp_path / "site"
+    city_page = site_root / "city" / "mumbai" / "page" / "1.html"
+    city_page.parent.mkdir(parents=True)
+    city_page.write_text(
+        NUMBERED_PAGE_HTML.replace(
+            '<p class="pager"><b>1</b> <a href="/city/mumbai/page/2.html">2</a></p>',
+            "",
+        ),
+        encoding="utf-8",
+    )
+    detail_page = site_root / "product" / "7.html"
+    detail_page.parent.mkdir()
+    detail_page.write_text("<html><h2>Broken</h2></html>", encoding="utf-8")
+    cache_path = tmp_path / "cache" / "bazaarpulse.json"
+    cache_path.parent.mkdir()
+    cache_path.write_text('{"last_good": true}\n', encoding="utf-8")
+
+    with pytest.raises(CollectionLimitError, match=r"/product/7\.html"):
+        BazaarPulseCollector.from_local(
+            site_root,
+            cache_path=cache_path,
+            max_detail_failures=0,
+        ).collect_snapshot(["/city/mumbai/page/1.html"])
+
+    assert cache_path.read_text(encoding="utf-8") == '{"last_good": true}\n'
+
+
+def test_missing_detail_page_is_recorded_without_dropping_current_listing(
+    tmp_path: Path,
+) -> None:
+    site_root = tmp_path / "site"
+    city_page = site_root / "city" / "mumbai" / "page" / "1.html"
+    city_page.parent.mkdir(parents=True)
+    city_page.write_text(
+        NUMBERED_PAGE_HTML.replace(
+            '<p class="pager"><b>1</b> <a href="/city/mumbai/page/2.html">2</a></p>',
+            "",
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = BazaarPulseCollector.from_local(site_root).collect_snapshot(
+        ["/city/mumbai/page/1.html"]
+    )
+
+    assert len(snapshot.listings) == 1
+    assert snapshot.source_price_observations == ()
+    assert len(snapshot.source_detail_failures) == 1
+    failure = snapshot.source_detail_failures[0]
+    assert failure.listing_id == "7"
+    assert failure.source_path == "/product/7.html"
+    assert failure.failure_type == "missing_detail_page"
 
 
 def test_disallowed_paths_are_rejected_before_local_or_http_access(tmp_path: Path) -> None:

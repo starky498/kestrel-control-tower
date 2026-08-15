@@ -79,6 +79,10 @@ def test_external_market_freight_and_context_survive_staged_rebuild(
                 ('obs-1', 'automatic_high_confidence'),
                 ('obs-2', 'manual_match')
             ) history(observation_id, provenance);
+            CREATE TABLE ext_bazaarpulse_source_price_observation AS
+            SELECT 'source-101-2026-06-20'::VARCHAR AS source_price_observation_id,
+                   '101'::VARCHAR AS listing_id, DATE '2026-06-20' AS observed_on,
+                   67.0::DOUBLE AS price_inr;
             CREATE TABLE ext_freight_invoice_current AS
             SELECT 'FI-1'::VARCHAR AS invoice_id, 125.50::DOUBLE AS amount_inr;
             CREATE TABLE ext_weather_daily_current AS
@@ -96,6 +100,9 @@ def test_external_market_freight_and_context_survive_staged_rebuild(
             QUALIFY row_number() OVER (
                 PARTITION BY listing_id ORDER BY observation_id DESC
             ) = 1;
+            CREATE VIEW vw_competitor_source_price_history AS
+            SELECT source_price_observation_id, listing_id, observed_on, price_inr
+            FROM ext_bazaarpulse_source_price_observation;
 
             CREATE TABLE old_core_only AS SELECT 1 AS value;
             CREATE VIEW vw_incompatible_legacy AS SELECT * FROM old_core_only;
@@ -109,11 +116,16 @@ def test_external_market_freight_and_context_survive_staged_rebuild(
         "external_sync_runs",
         "ext_bazaarpulse_listing_history",
         "ext_bazaarpulse_match_history",
+        "ext_bazaarpulse_source_price_observation",
         "ext_freight_invoice_current",
         "ext_india_holiday_current",
         "ext_weather_daily_current",
     }
-    assert set(summary.views) == {"vw_competitor_price_history", "vw_market_latest"}
+    assert set(summary.views) == {
+        "vw_competitor_price_history",
+        "vw_competitor_source_price_history",
+        "vw_market_latest",
+    }
     assert summary.skipped_views == ("vw_incompatible_legacy",)
 
     os.replace(staged, analytics)
@@ -124,6 +136,7 @@ def test_external_market_freight_and_context_survive_staged_rebuild(
                 (SELECT count(*) FROM ext_bazaarpulse_listing_history),
                 (SELECT count(*) FROM ext_bazaarpulse_match_history),
                 (SELECT count(*) FROM vw_competitor_price_history),
+                (SELECT count(*) FROM vw_competitor_source_price_history),
                 (SELECT provenance FROM vw_market_latest),
                 (SELECT count(*) FROM ext_freight_invoice_current),
                 (SELECT count(*) FROM ext_weather_daily_current),
@@ -138,7 +151,7 @@ def test_external_market_freight_and_context_survive_staged_rebuild(
             WHERE table_name = 'old_core_only'
             """
         ).fetchone()[0]
-    assert state == (2, 2, 2, "manual_match", 1, 1, 1, 1, 2)
+    assert state == (2, 2, 2, 1, "manual_match", 1, 1, 1, 1, 2)
     assert old_core_exists == 0
 
 

@@ -28,6 +28,8 @@ class FilterSet:
     route_codes: tuple[str, ...] = ()
     outlet_codes: tuple[str, ...] = ()
     channels: tuple[str, ...] = ()
+    promotion_codes: tuple[str, ...] = ()
+    order_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,9 @@ ORDER_DIMENSIONS: dict[str, tuple[str, str]] = {
     "route": ("route_code", "Route"),
     "outlet": ("outlet_code", "Outlet"),
     "channel": ("channel", "Channel"),
+    "promotion": ("promotion_code", "Recorded promotion code"),
+    "promotion_mechanic": ("promotion_mechanic", "Recorded promotion mechanic"),
+    "order_source": ("source_system", "Order source"),
 }
 
 LINE_DIMENSIONS: dict[str, tuple[str, str]] = {
@@ -67,6 +72,9 @@ RETURN_DIMENSIONS: dict[str, tuple[str, str]] = {
     "reason": ("return_reason_code", "Return reason"),
     "disposition": ("disposition", "Disposition"),
     "status": ("credit_note_status", "Credit status"),
+    "promotion": ("promotion_code", "Recorded promotion code"),
+    "promotion_mechanic": ("promotion_mechanic", "Recorded promotion mechanic"),
+    "order_source": ("source_system", "Order source"),
 }
 
 DELIVERY_EXCEPTION_DIMENSIONS: dict[str, tuple[str, str]] = {
@@ -76,6 +84,21 @@ DELIVERY_EXCEPTION_DIMENSIONS: dict[str, tuple[str, str]] = {
     "customer_region": ("customer_region_name", "Customer region"),
     "channel": ("channel", "Channel"),
     "telematics_vendor": ("telematics_vendor", "Telematics vendor"),
+    "promotion": ("promotion_code", "Recorded promotion code"),
+    "order_source": ("source_system", "Order source"),
+}
+
+COLD_CHAIN_DIMENSIONS: dict[str, tuple[str, str]] = {
+    "customer_region": ("customer_region_name", "Customer region"),
+    "warehouse_region": ("warehouse_region_name", "DC region"),
+    "warehouse": ("warehouse_code", "Warehouse"),
+    "route": ("route_code", "Route"),
+    "outlet": ("outlet_code", "Outlet"),
+    "channel": ("channel", "Channel"),
+    "promotion": ("promotion_code", "Recorded promotion code"),
+    "order_source": ("source_system", "Order source"),
+    "category": ("category", "Chilled category"),
+    "month": ("date_trunc('month', delivery_date)::DATE", "Delivery month"),
 }
 
 
@@ -118,6 +141,8 @@ class AnalyticsService:
                 ("route_code", filters.route_codes),
                 ("outlet_code", filters.outlet_codes),
                 ("channel", filters.channels),
+                ("promotion_code", filters.promotion_codes),
+                ("source_system", filters.order_sources),
             )
             for column, values_iterable in dimension_filters:
                 values = tuple(values_iterable)
@@ -146,6 +171,8 @@ class AnalyticsService:
             ("route_code", filters.route_codes),
             ("outlet_code", filters.outlet_codes),
             ("channel", filters.channels),
+            ("promotion_code", filters.promotion_codes),
+            ("source_system", filters.order_sources),
         )
         for column, values_iterable in dimension_filters:
             values = tuple(values_iterable)
@@ -171,6 +198,8 @@ class AnalyticsService:
             "route_codes": "route_code",
             "outlet_codes": "outlet_code",
             "channels": "channel",
+            "promotion_codes": "promotion_code",
+            "order_sources": "source_system",
         }
         options: dict[str, list[str]] = {}
         with self._connect() as connection:
@@ -192,12 +221,29 @@ class AnalyticsService:
         service_sql = f"""
             SELECT
                 count(*) AS records,
-                sum(delivered_{quantity_suffix}) AS delivered_qty,
+                sum(capped_delivered_{quantity_suffix}) AS capped_delivered_qty,
+                sum(delivered_{quantity_suffix}) AS raw_delivered_qty,
                 sum(allocated_{quantity_suffix}) AS allocated_qty,
                 sum(ordered_{quantity_suffix}) AS ordered_qty,
-                count(*) FILTER (WHERE on_time_by_timestamp) AS on_time_orders,
+                sum(capped_delivered_eaches) AS delivered_eaches,
+                sum(ordered_eaches) AS ordered_eaches,
+                sum(capped_delivered_case_equivalents) AS delivered_case_equivalents,
+                sum(ordered_case_equivalents) AS ordered_case_equivalents,
+                count(*) FILTER (
+                    WHERE planned_arrival_ts IS NOT NULL
+                      AND actual_arrival_ts IS NOT NULL
+                ) AS timestamp_eligible_orders,
+                count(*) FILTER (
+                    WHERE planned_arrival_ts IS NOT NULL
+                      AND actual_arrival_ts IS NOT NULL
+                      AND on_time_by_timestamp
+                ) AS on_time_orders,
                 count(*) FILTER (WHERE strict_otif) AS otif_orders,
-                count(*) FILTER (WHERE late_over_2h) AS late_over_2h_orders
+                count(*) FILTER (
+                    WHERE planned_arrival_ts IS NOT NULL
+                      AND actual_arrival_ts IS NOT NULL
+                      AND late_over_2h
+                ) AS late_over_2h_orders
             FROM fct_order_service
             WHERE is_eligible_service AND {where}
         """
@@ -214,7 +260,9 @@ class AnalyticsService:
             filters, date_column="requested_delivery_date"
         )
         dispatch_sql = f"""
-            SELECT sum(estimated_dispatch_value_inr)
+            SELECT sum(estimated_dispatch_value_inr),
+                   sum(short_delivery_value_exposure_inr),
+                   count(*) FILTER (WHERE short_eaches > 0)
             FROM fct_order_line
             WHERE is_eligible_service AND {line_where}
         """
@@ -240,7 +288,9 @@ class AnalyticsService:
         with self._connect() as connection:
             service = connection.execute(service_sql, parameters).fetchone()
             cold = connection.execute(cold_sql, delivery_parameters).fetchone()
-            dispatch_value = connection.execute(dispatch_sql, line_parameters).fetchone()[0]
+            dispatch_value, short_value_exposure, short_lines = connection.execute(
+                dispatch_sql, line_parameters
+            ).fetchone()
             approved_credit, approved_records = connection.execute(
                 credit_sql, return_parameters
             ).fetchone()
@@ -274,15 +324,45 @@ class AnalyticsService:
                     inventory_parameters,
                 ).fetchone()[0]
 
-        records, delivered, allocated, ordered, on_time, otif, late_over_2h = service
+        (
+            records,
+            capped_delivered,
+            raw_delivered,
+            allocated,
+            ordered,
+            delivered_eaches,
+            ordered_eaches,
+            delivered_case_equivalents,
+            ordered_case_equivalents,
+            timestamp_eligible,
+            on_time,
+            otif,
+            late_over_2h,
+        ) = service
         chilled_deliveries, excursions = cold
         cold_rate = self._ratio(excursions, chilled_deliveries)
         return {
             "fill_rate": MetricValue(
                 "fill_rate",
-                self._ratio(delivered, ordered),
-                self._number(delivered),
+                self._ratio(capped_delivered, ordered),
+                self._number(capped_delivered),
                 self._number(ordered),
+                "percent",
+                records,
+            ),
+            "fill_rate_eaches": MetricValue(
+                "fill_rate_eaches",
+                self._ratio(delivered_eaches, ordered_eaches),
+                self._number(delivered_eaches),
+                self._number(ordered_eaches),
+                "percent",
+                records,
+            ),
+            "fill_rate_case_equivalents": MetricValue(
+                "fill_rate_case_equivalents",
+                self._ratio(delivered_case_equivalents, ordered_case_equivalents),
+                self._number(delivered_case_equivalents),
+                self._number(ordered_case_equivalents),
                 "percent",
                 records,
             ),
@@ -296,8 +376,8 @@ class AnalyticsService:
             ),
             "post_allocation_fulfilment": MetricValue(
                 "post_allocation_fulfilment",
-                self._ratio(delivered, allocated),
-                self._number(delivered),
+                self._ratio(raw_delivered, allocated),
+                self._number(raw_delivered),
                 self._number(allocated),
                 "percent",
                 records,
@@ -312,17 +392,17 @@ class AnalyticsService:
             ),
             "on_time_rate": MetricValue(
                 "on_time_rate",
-                self._ratio(on_time, records),
+                self._ratio(on_time, timestamp_eligible),
                 self._number(on_time),
-                self._number(records),
+                self._number(timestamp_eligible),
                 "percent",
                 records,
             ),
             "late_over_2h_rate": MetricValue(
                 "late_over_2h_rate",
-                self._ratio(late_over_2h, records),
+                self._ratio(late_over_2h, timestamp_eligible),
                 self._number(late_over_2h),
-                self._number(records),
+                self._number(timestamp_eligible),
                 "percent",
                 records,
             ),
@@ -349,6 +429,14 @@ class AnalyticsService:
                 self._number(dispatch_value),
                 "percent",
                 approved_records,
+            ),
+            "short_delivery_value_exposure_inr": MetricValue(
+                "short_delivery_value_exposure_inr",
+                self._number(short_value_exposure),
+                self._number(short_value_exposure),
+                None,
+                "INR",
+                int(short_lines or 0),
             ),
             "overdue_backlog_orders": MetricValue(
                 "overdue_backlog_orders",
@@ -395,7 +483,8 @@ class AnalyticsService:
                        AS allocation_rate,
                    sum(delivered_{suffix}) / nullif(sum(allocated_{suffix}), 0)
                        AS post_allocation_fulfilment,
-                   sum(delivered_{suffix}) / nullif(sum(ordered_{suffix}), 0) AS fill_rate,
+                   sum(capped_delivered_{suffix})
+                       / nullif(sum(ordered_{suffix}), 0) AS fill_rate,
                    avg(CAST(on_time_by_timestamp AS INTEGER)) AS on_time_rate,
                    avg(CAST(strict_otif AS INTEGER)) AS strict_otif_rate,
                    avg(CAST(late_over_2h AS INTEGER)) AS late_over_2h_rate
@@ -426,7 +515,8 @@ class AnalyticsService:
                        AS allocation_rate,
                    sum(delivered_{suffix}) / nullif(sum(allocated_{suffix}), 0)
                        AS post_allocation_fulfilment,
-                   sum(delivered_{suffix}) / nullif(sum(ordered_{suffix}), 0) AS fill_rate,
+                   sum(capped_delivered_{suffix})
+                       / nullif(sum(ordered_{suffix}), 0) AS fill_rate,
                    avg(CAST(on_time_by_timestamp AS INTEGER)) AS on_time_rate,
                    avg(CAST(strict_otif AS INTEGER)) AS strict_otif_rate,
                    sum(short_{suffix}) AS short_quantity
@@ -437,6 +527,145 @@ class AnalyticsService:
         """
         with self._connect() as connection:
             return connection.execute(sql, parameters).fetchdf()
+
+    def fulfilment_flow(
+        self,
+        filters: FilterSet,
+        basis: QuantityBasis = QuantityBasis.EACHES,
+        *,
+        return_statuses: tuple[str, ...] = ("APPROVED", "PENDING", "REJECTED"),
+    ) -> pd.DataFrame:
+        """Return a line-cohort Ordered→Allocated→Delivered→Returned flow.
+
+        Order quantities use the requested-delivery cohort. Returns are independently
+        aggregated to ``order_line_id`` and include only records observed on or before the
+        selected end date, preventing a one-to-many return join from inflating the first three
+        stages. Returned quantity is intentionally not capped at delivered quantity.
+        """
+
+        if not return_statuses:
+            raise ValueError("At least one return status is required")
+        suffix = "eaches" if basis == QuantityBasis.EACHES else "case_equivalents"
+        where, parameters = self._filter_sql(
+            filters, date_column="requested_delivery_date"
+        )
+        status_placeholders = ", ".join("?" for _ in return_statuses)
+        parameters.extend([filters.end_date, *return_statuses])
+        sql = f"""
+            WITH selected_lines AS (
+                SELECT order_line_id,
+                       ordered_{suffix} AS ordered_quantity,
+                       allocated_{suffix} AS allocated_quantity,
+                       delivered_{suffix} AS delivered_quantity,
+                       allocation_short_{suffix} AS allocation_shortfall_quantity,
+                       post_allocation_short_{suffix}
+                           AS post_allocation_shortfall_quantity
+                FROM fct_order_line
+                WHERE is_eligible_service AND {where}
+            ), return_rollup AS (
+                SELECT order_line_id,
+                       sum(return_{suffix}) AS returned_quantity
+                FROM fct_return_credit_note
+                WHERE return_date <= ?
+                  AND credit_note_status IN ({status_placeholders})
+                GROUP BY order_line_id
+            )
+            SELECT count(*) AS eligible_order_lines,
+                   sum(ordered_quantity) AS ordered_quantity,
+                   sum(allocated_quantity) AS allocated_quantity,
+                   sum(delivered_quantity) AS delivered_quantity,
+                   coalesce(sum(returned_quantity), 0) AS returned_quantity,
+                   sum(allocation_shortfall_quantity)
+                       AS allocation_shortfall_quantity,
+                   sum(post_allocation_shortfall_quantity)
+                       AS post_allocation_shortfall_quantity
+            FROM selected_lines
+            LEFT JOIN return_rollup USING (order_line_id)
+        """
+        with self._connect() as connection:
+            frame = connection.execute(sql, parameters).fetchdf()
+        frame.attrs.update(
+            {
+                "grain": "One aggregate over a requested-delivery order-line cohort",
+                "cohort": (
+                    "Eligible DELIVERED/PARTIAL order lines for active, non-test outlets "
+                    "within the selected requested-delivery dates and dimensions"
+                ),
+                "date_basis": (
+                    "Ordered/allocated/delivered: requested delivery date; returned: "
+                    "linked return records observed on or before selected end date"
+                ),
+                "return_statuses": return_statuses,
+                "quantity_basis": basis.value,
+                "warning": (
+                    "Returned quantity is a linked physical-return signal across the selected "
+                    "credit statuses; it is not capped and does not imply approved recovery."
+                ),
+            }
+        )
+        return frame
+
+    def service_line_evidence(
+        self, filters: FilterSet, *, limit: int = 200
+    ) -> pd.DataFrame:
+        """Return native order-line evidence, including recorded source and promotion."""
+
+        if limit < 1 or limit > 1_000:
+            raise ValueError("limit must be between 1 and 1000")
+        where, parameters = self._filter_sql(
+            filters, date_column="requested_delivery_date", prefix="line"
+        )
+        parameters.extend([filters.end_date, limit])
+        sql = f"""
+            WITH return_rollup AS (
+                SELECT order_line_id,
+                       sum(return_eaches) AS returned_eaches,
+                       sum(return_case_equivalents) AS returned_case_equivalents
+                FROM fct_return_credit_note
+                WHERE return_date <= ?
+                GROUP BY order_line_id
+            )
+            SELECT line.order_line_id, line.order_number,
+                   line.requested_delivery_date, line.source_system,
+                   line.created_at_raw, line.created_at_ist,
+                   line.created_at_parse_status,
+                   line.promotion_code, line.promotion_name,
+                   line.promotion_mechanic, line.promotion_applied,
+                   line.customer_region_name, line.warehouse_code,
+                   line.route_code, line.outlet_code, line.channel,
+                   line.sku_code, line.product_name, line.category,
+                   line.ordered_eaches, line.allocated_eaches,
+                   line.delivered_eaches,
+                   coalesce(returns.returned_eaches, 0) AS returned_eaches,
+                   line.ordered_case_equivalents,
+                   line.allocated_case_equivalents,
+                   line.delivered_case_equivalents,
+                   coalesce(returns.returned_case_equivalents, 0)
+                       AS returned_case_equivalents,
+                   line.short_eaches, line.short_case_equivalents,
+                   line.short_delivery_value_exposure_inr,
+                   line.short_reason_code
+            FROM fct_order_line line
+            LEFT JOIN return_rollup returns USING (order_line_id)
+            WHERE line.is_eligible_service AND {where}
+            ORDER BY line.short_delivery_value_exposure_inr DESC,
+                     line.short_eaches DESC, line.order_line_id
+            LIMIT ?
+        """
+        query_parameters = [parameters[-2], *parameters[:-2], parameters[-1]]
+        with self._connect() as connection:
+            frame = connection.execute(sql, query_parameters).fetchdf()
+        frame.attrs.update(
+            {
+                "grain": "One eligible order line",
+                "promotion_definition": (
+                    "Recorded order promo_code enriched from the promotion catalogue; this "
+                    "shows association, not redemption effectiveness or causal uplift."
+                ),
+                "return_date_basis": "Linked returns observed on or before selected end date",
+            }
+        )
+        return frame
 
     def service_rankings(
         self,
@@ -500,6 +729,8 @@ class AnalyticsService:
             route_codes=filters.route_codes,
             outlet_codes=filters.outlet_codes,
             channels=filters.channels,
+            promotion_codes=filters.promotion_codes,
+            order_sources=filters.order_sources,
         )
         previous = self.service_by_dimension(
             previous_filters, dimension, basis, limit=None, worst_first=False
@@ -778,6 +1009,8 @@ class AnalyticsService:
                    count(*) AS lines,
                    sum(short_eaches) AS short_eaches,
                    sum(short_case_equivalents) AS short_case_equivalents,
+                   sum(short_delivery_value_exposure_inr)
+                       AS short_delivery_value_exposure_inr,
                    sum(estimated_dispatch_value_inr) AS estimated_dispatch_value_inr
             FROM fct_order_line
             WHERE is_eligible_service AND short_eaches > 0 AND {where}
@@ -790,30 +1023,160 @@ class AnalyticsService:
         frame.attrs["dimension_label"] = label
         return frame
 
+    def short_delivery_exposure(
+        self,
+        filters: FilterSet,
+        dimension: str,
+        basis: QuantityBasis = QuantityBasis.EACHES,
+        *,
+        limit: int = 30,
+    ) -> pd.DataFrame:
+        """Aggregate booked line-value exposure from undelivered quantity at line grain."""
+
+        if dimension not in LINE_DIMENSIONS:
+            raise ValueError(f"Unsupported short-delivery dimension: {dimension}")
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        column, label = LINE_DIMENSIONS[dimension]
+        suffix = "eaches" if basis == QuantityBasis.EACHES else "case_equivalents"
+        where, parameters = self._filter_sql(
+            filters, date_column="requested_delivery_date"
+        )
+        parameters.append(limit)
+        sql = f"""
+            SELECT {column} AS dimension_value,
+                   count(*) AS short_lines,
+                   count(DISTINCT order_id) AS affected_orders,
+                   sum(short_{suffix}) AS short_quantity,
+                   sum(line_value_inr) AS booked_line_value_inr,
+                   sum(short_delivery_value_exposure_inr)
+                       AS short_delivery_value_exposure_inr,
+                   sum(short_delivery_value_exposure_inr)
+                       / nullif(sum(line_value_inr), 0) AS exposure_share_of_booked_value,
+                   sum(allocation_short_value_exposure_inr)
+                       AS allocation_short_value_exposure_inr,
+                   sum(post_allocation_short_value_exposure_inr)
+                       AS post_allocation_short_value_exposure_inr
+            FROM fct_order_line
+            WHERE is_eligible_service AND short_{suffix} > 0
+              AND {column} IS NOT NULL AND {where}
+            GROUP BY {column}
+            ORDER BY short_delivery_value_exposure_inr DESC,
+                     short_quantity DESC, dimension_value
+            LIMIT ?
+        """
+        with self._connect() as connection:
+            frame = connection.execute(sql, parameters).fetchdf()
+        frame.attrs.update(
+            {
+                "dimension_label": label,
+                "grain": "Eligible order lines aggregated by the selected dimension",
+                "quantity_basis": basis.value,
+                "value_definition": (
+                    "Booked line_value_inr multiplied by the positive undelivered share "
+                    "(ordered_qty - delivered_qty) / ordered_qty. This is commercial "
+                    "exposure, not accounting loss, profit, cash, or causal attribution."
+                ),
+            }
+        )
+        return frame
+
     def cold_chain_by_dimension(
         self, filters: FilterSet, dimension: str, *, limit: int = 20
     ) -> pd.DataFrame:
-        if dimension not in ORDER_DIMENSIONS:
+        """Aggregate source-flagged excursions with descriptive peak-temperature evidence."""
+
+        if dimension not in COLD_CHAIN_DIMENSIONS:
             raise ValueError(f"Unsupported cold-chain dimension: {dimension}")
-        column, label = ORDER_DIMENSIONS[dimension]
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        column, label = COLD_CHAIN_DIMENSIONS[dimension]
         where, parameters = self._filter_sql(filters, date_column="delivery_date")
         parameters.append(limit)
+        relation = "fct_delivery"
+        grain = "One delivery"
+        non_additive_warning = ""
+        if dimension == "category":
+            relation = """
+                fct_delivery
+                JOIN (
+                    SELECT DISTINCT order_id, category
+                    FROM fct_order_line
+                    WHERE is_chilled AND category IS NOT NULL
+                ) chilled_category USING (order_id)
+            """
+            grain = "One delivery × chilled-category pair"
+            non_additive_warning = (
+                "A multi-category delivery appears once in each chilled category; category "
+                "rows must not be summed to an all-delivery total."
+            )
         sql = f"""
             SELECT {column} AS dimension_value,
                    count(*) AS chilled_deliveries,
                    count(*) FILTER (WHERE temperature_excursion_flag) AS excursions,
                    100.0 * count(*) FILTER (WHERE temperature_excursion_flag)
-                       / nullif(count(*), 0) AS excursions_per_100
-            FROM fct_delivery
-            WHERE is_eligible_service AND has_chilled_product AND {where}
+                       / nullif(count(*), 0) AS excursions_per_100,
+                   avg(max_temp_celsius) AS avg_recorded_max_temp_c,
+                   max(max_temp_celsius) AS peak_recorded_max_temp_c,
+                   avg(max_temp_celsius) FILTER (WHERE temperature_excursion_flag)
+                       AS avg_excursion_max_temp_c,
+                   max(max_temp_celsius) FILTER (WHERE temperature_excursion_flag)
+                       AS peak_excursion_max_temp_c,
+                   count(*) FILTER (
+                       WHERE temperature_excursion_flag AND max_temp_celsius <= 8
+                   ) AS flagged_peak_le_8c,
+                   count(*) FILTER (
+                       WHERE temperature_excursion_flag
+                         AND max_temp_celsius > 8 AND max_temp_celsius <= 12
+                   ) AS flagged_peak_8_to_12c,
+                   count(*) FILTER (
+                       WHERE temperature_excursion_flag AND max_temp_celsius > 12
+                   ) AS flagged_peak_over_12c,
+                   count(*) FILTER (
+                       WHERE temperature_excursion_flag AND max_temp_celsius IS NULL
+                   ) AS flagged_peak_unavailable,
+                   CASE
+                       WHEN max(max_temp_celsius) FILTER (
+                           WHERE temperature_excursion_flag
+                       ) IS NULL THEN 'No flagged peak recorded'
+                       WHEN max(max_temp_celsius) FILTER (
+                           WHERE temperature_excursion_flag
+                       ) > 12 THEN 'Flagged peak >12C'
+                       WHEN max(max_temp_celsius) FILTER (
+                           WHERE temperature_excursion_flag
+                       ) > 8 THEN 'Flagged peak >8-12C'
+                       ELSE 'Flagged peak <=8C'
+                   END AS descriptive_peak_band
+            FROM {relation}
+            WHERE is_eligible_service AND has_chilled_product
+              AND {column} IS NOT NULL AND {where}
             GROUP BY {column}
-            ORDER BY excursions_per_100 DESC, excursions DESC
+            ORDER BY excursions_per_100 DESC, excursions DESC,
+                     peak_excursion_max_temp_c DESC NULLS LAST, dimension_value
             LIMIT ?
         """
         with self._connect() as connection:
             frame = connection.execute(sql, parameters).fetchdf()
-        frame.attrs["dimension_label"] = label
+        frame.attrs.update(
+            {
+                "dimension_label": label,
+                "grain": grain,
+                "severity_definition": (
+                    "The <=8C, >8-12C, and >12C bands describe recorded peak "
+                    "temperature among source-flagged deliveries only. They are not validated "
+                    "food-safety limits and do not define or explain the source flag."
+                ),
+                "warning": non_additive_warning,
+            }
+        )
         return frame
+
+    def cold_chain_trend(self, filters: FilterSet) -> pd.DataFrame:
+        """Return the same governed excursion evidence at delivery-month grain."""
+
+        frame = self.cold_chain_by_dimension(filters, "month", limit=120)
+        frame.attrs["date_basis"] = "Actual delivery month"
+        return frame.sort_values("dimension_value").reset_index(drop=True)
 
     def inventory_risk(
         self, filters: FilterSet, dimension: str = "warehouse"
@@ -874,7 +1237,97 @@ class AnalyticsService:
             ignored_filters.append("outlet")
         if filters.channels:
             ignored_filters.append("channel")
+        if filters.promotion_codes:
+            ignored_filters.append("promotion")
+        if filters.order_sources:
+            ignored_filters.append("order source")
         frame.attrs["ignored_filters"] = tuple(ignored_filters)
+        return frame
+
+    def inventory_batch_evidence(
+        self,
+        filters: FilterSet,
+        *,
+        risk_only: bool = True,
+        limit: int = 200,
+    ) -> pd.DataFrame:
+        """Return latest-as-of inventory evidence at source batch-snapshot grain."""
+
+        if limit < 1 or limit > 1_000:
+            raise ValueError("limit must be between 1 and 1000")
+        with self._connect() as connection:
+            snapshot_date = connection.execute(
+                "SELECT max(snapshot_date) FROM fct_inventory_snapshot "
+                "WHERE snapshot_date <= ?",
+                [filters.end_date],
+            ).fetchone()[0]
+            if snapshot_date is None:
+                frame = pd.DataFrame()
+                frame.attrs["snapshot_date"] = None
+                return frame
+
+            conditions = ["snapshot_date = ?"]
+            parameters: list[Any] = [snapshot_date]
+            for column, values in (
+                ("warehouse_region_name", filters.warehouse_regions),
+                ("warehouse_code", filters.warehouse_codes),
+            ):
+                if values:
+                    placeholders = ", ".join("?" for _ in values)
+                    conditions.append(f"{column} IN ({placeholders})")
+                    parameters.extend(values)
+            if risk_only:
+                conditions.append(
+                    "((available_cases > 0 AND expiry_days BETWEEN 0 AND ?) "
+                    "OR (available_cases > 0 AND expiry_days < 0) "
+                    "OR damaged_cases > 0 OR blocked_cases > 0)"
+                )
+                parameters.append(self.near_expiry_days)
+            parameters.append(limit)
+            frame = connection.execute(
+                f"""
+                SELECT snapshot_id, snapshot_date, warehouse_region_name,
+                       warehouse_code, warehouse_name, sku_code, product_name,
+                       category, subcategory, is_chilled, storage_temp_band,
+                       batch_id, on_hand_cases, on_hand_eaches, allocated_cases,
+                       available_cases, days_of_cover, expiry_date, expiry_days,
+                       ageing_bucket, damaged_cases, blocked_cases,
+                       storage_temp_celsius,
+                       (available_cases > 0 AND expiry_days BETWEEN 0 AND
+                           {self.near_expiry_days}) AS near_expiry_flag,
+                       (available_cases > 0 AND expiry_days < 0) AS expired_stock_flag,
+                       (damaged_cases > 0) AS damaged_stock_flag,
+                       (blocked_cases > 0) AS blocked_stock_flag
+                FROM fct_inventory_snapshot
+                WHERE {' AND '.join(conditions)}
+                ORDER BY expired_stock_flag DESC, near_expiry_flag DESC,
+                         damaged_cases DESC, blocked_cases DESC,
+                         available_cases DESC, snapshot_id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchdf()
+
+        ignored_filters: list[str] = []
+        for label, values in (
+            ("customer region", filters.customer_regions),
+            ("route", filters.route_codes),
+            ("outlet", filters.outlet_codes),
+            ("channel", filters.channels),
+            ("promotion", filters.promotion_codes),
+            ("order source", filters.order_sources),
+        ):
+            if values:
+                ignored_filters.append(label)
+        frame.attrs.update(
+            {
+                "snapshot_date": snapshot_date,
+                "grain": "One warehouse × SKU × batch × weekly source snapshot row",
+                "risk_only": risk_only,
+                "near_expiry_days": self.near_expiry_days,
+                "ignored_filters": tuple(ignored_filters),
+            }
+        )
         return frame
 
     def returns_by_dimension(
@@ -922,6 +1375,60 @@ class AnalyticsService:
         """
         with self._connect() as connection:
             return connection.execute(sql, parameters).fetchdf()
+
+    def return_disposition_summary(
+        self,
+        filters: FilterSet,
+        *,
+        statuses: tuple[str, ...] = ("APPROVED", "PENDING", "REJECTED"),
+    ) -> pd.DataFrame:
+        """Summarise physical returns and associated credit value by disposition."""
+
+        if not statuses:
+            raise ValueError("At least one credit-note status is required")
+        where, parameters = self._filter_sql(filters, date_column="return_date")
+        status_placeholders = ", ".join("?" for _ in statuses)
+        parameters.extend(statuses)
+        sql = f"""
+            SELECT disposition,
+                   count(*) AS credit_note_lines,
+                   count(*) FILTER (WHERE credit_note_status = 'APPROVED')
+                       AS approved_lines,
+                   count(*) FILTER (WHERE credit_note_status = 'PENDING')
+                       AS pending_lines,
+                   count(*) FILTER (WHERE credit_note_status = 'REJECTED')
+                       AS rejected_lines,
+                   sum(return_eaches) AS return_eaches,
+                   sum(return_case_equivalents) AS return_case_equivalents,
+                   sum(credit_note_value_inr) AS associated_credit_note_value_inr,
+                   sum(credit_note_value_inr) FILTER (
+                       WHERE credit_note_status = 'APPROVED'
+                   ) AS approved_credit_note_value_inr,
+                   sum(credit_note_value_inr) FILTER (
+                       WHERE credit_note_status = 'PENDING'
+                   ) AS pending_credit_note_value_inr,
+                   sum(credit_note_value_inr) FILTER (
+                       WHERE credit_note_status = 'REJECTED'
+                   ) AS rejected_credit_note_value_inr
+            FROM fct_return_credit_note
+            WHERE {where} AND credit_note_status IN ({status_placeholders})
+            GROUP BY disposition
+            ORDER BY associated_credit_note_value_inr DESC, disposition
+        """
+        with self._connect() as connection:
+            frame = connection.execute(sql, parameters).fetchdf()
+        frame.attrs.update(
+            {
+                "grain": "Return credit-note lines aggregated by source disposition",
+                "statuses": statuses,
+                "warning": (
+                    "RESTOCK, SCRAP, and VENDOR_RECOVERY are recorded dispositions. "
+                    "Associated or approved credit-note value is not proof of cash receipt, "
+                    "inventory recovery, vendor reimbursement, profit, or causation."
+                ),
+            }
+        )
+        return frame
 
     def cold_chain_return_evidence(
         self,

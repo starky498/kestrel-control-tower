@@ -88,6 +88,8 @@ class IntentFilters:
     route_codes: tuple[str, ...] = ()
     outlet_codes: tuple[str, ...] = ()
     channels: tuple[str, ...] = ()
+    promotion_codes: tuple[str, ...] = ()
+    order_sources: tuple[str, ...] = ()
     cities: tuple[str, ...] = ()
     categories: tuple[str, ...] = ()
 
@@ -101,6 +103,8 @@ class IntentFilters:
             route_codes=self.route_codes,
             outlet_codes=self.outlet_codes,
             channels=self.channels,
+            promotion_codes=self.promotion_codes,
+            order_sources=self.order_sources,
         )
 
     def labels(self) -> tuple[str, ...]:
@@ -112,6 +116,8 @@ class IntentFilters:
             ("route", self.route_codes),
             ("outlet", self.outlet_codes),
             ("channel", self.channels),
+            ("promotion", self.promotion_codes),
+            ("order source", self.order_sources),
             ("city", self.cities),
             ("category", self.categories),
         ):
@@ -237,6 +243,15 @@ class MetricService(Protocol):
         self, filters: FilterSet, basis: QuantityBasis = QuantityBasis.EACHES
     ) -> pd.DataFrame: ...
 
+    def delivery_exceptions_by_dimension(
+        self,
+        filters: FilterSet,
+        dimension: str,
+        *,
+        min_deliveries: int = 50,
+        limit: int = 30,
+    ) -> pd.DataFrame: ...
+
     def cold_chain_by_dimension(
         self, filters: FilterSet, dimension: str, *, limit: int = 20
     ) -> pd.DataFrame: ...
@@ -249,6 +264,8 @@ class MetricService(Protocol):
         statuses: tuple[str, ...] = ("APPROVED",),
         limit: int = 20,
     ) -> pd.DataFrame: ...
+
+    def credit_status_summary(self, filters: FilterSet) -> pd.DataFrame: ...
 
     def discontinued_order_evidence(
         self, filters: FilterSet, *, limit: int = 100
@@ -284,8 +301,9 @@ class _MetricSpec:
 
 _SPECS: dict[MetricKey, _MetricSpec] = {
     MetricKey.FILL_RATE: _MetricSpec(
-        "Ratio of sums: delivered normalized quantity divided by ordered normalized "
-        "quantity for eligible delivered/partial orders.",
+        "Ratio of sums: each eligible order line contributes the lower of delivered and ordered "
+        "normalized quantity, divided by ordered normalized quantity, so oversupply on one line "
+        "cannot offset a shortfall on another.",
         ("fct_order_service", "orders", "order_lines"),
     ),
     MetricKey.STRICT_OTIF: _MetricSpec(
@@ -295,7 +313,8 @@ _SPECS: dict[MetricKey, _MetricSpec] = {
     ),
     MetricKey.RETURNS: _MetricSpec(
         "Approved credit-note value and normalized absolute return quantity, grouped by "
-        "the requested dimension; pending and rejected notes are excluded.",
+        "the requested dimension. Pending and rejected notes are excluded from that headline "
+        "and shown separately as workflow-status evidence.",
         ("fct_return_credit_note", "returns_credit_notes", "products"),
     ),
     MetricKey.CHILLED_EXCURSIONS: _MetricSpec(
@@ -314,8 +333,9 @@ _SPECS: dict[MetricKey, _MetricSpec] = {
         ("products", "product_price_history", "BazaarPulse observations"),
     ),
     MetricKey.FREIGHT_PER_CASE: _MetricSpec(
-        "Carrier billed freight in INR divided by delivered case-equivalents for the same "
-        "service period and independently reconciled dimension.",
+        "PAID carrier freight in INR divided by delivered case-equivalents for the same "
+        "service period and independently reconciled dimension; other invoice statuses remain "
+        "secondary evidence.",
         ("partner freight invoices", "fct_order_line", "warehouses", "routes"),
     ),
     MetricKey.DISCONTINUED_SKUS: _MetricSpec(
@@ -768,6 +788,8 @@ def _extract_filters(text: str, options: dict[str, list[str]]) -> tuple[IntentFi
             channels.append(value)
 
     cities = tuple(city for city in _CITY_NAMES if city.casefold() in text)
+    promotion_codes = _matching_options(text, options.get("promotion_codes", []))
+    order_sources = _matching_options(text, options.get("order_sources", []))
     return (
         IntentFilters(
             customer_regions=customer_regions,
@@ -776,6 +798,8 @@ def _extract_filters(text: str, options: dict[str, list[str]]) -> tuple[IntentFi
             route_codes=route_codes,
             outlet_codes=outlet_codes,
             channels=tuple(dict.fromkeys(channels)),
+            promotion_codes=promotion_codes,
+            order_sources=order_sources,
             cities=cities,
         ),
         None,
@@ -1275,7 +1299,16 @@ class QuestionRouter:
                     frame,
                 )
             )
-        first_nonempty = next((block for block in evidence if block.rows), None)
+        ranked_evidence = tuple(evidence)
+        status = self.metric_service.credit_status_summary(filters)
+        evidence.append(
+            _frame_evidence(
+                "Credit-note workflow status",
+                "fct_return_credit_note",
+                status,
+            )
+        )
+        first_nonempty = next((block for block in ranked_evidence if block.rows), None)
         if first_nonempty is None:
             summary = "No approved return evidence was found."
         else:
@@ -1285,7 +1318,15 @@ class QuestionRouter:
                 f"Leading {first_nonempty.title.removeprefix('Approved returns by ')} is "
                 f"{row[0]} with ₹{_format_number(row[amount_index])} in approved credit notes."
             )
-        return self._base_answer(intent, summary, tuple(evidence))
+        return self._base_answer(
+            intent,
+            summary,
+            tuple(evidence),
+            warnings=(
+                "Only APPROVED credit notes drive the ranking and headline value; PENDING and "
+                "REJECTED rows are shown separately as workflow evidence.",
+            ),
+        )
 
     def _chilled_excursions(self, intent: QuestionIntent) -> QuestionAnswer:
         filters = intent.filters.to_metric_filters(intent.period)
@@ -1350,8 +1391,12 @@ class QuestionRouter:
 
     def _late_routes(self, intent: QuestionIntent) -> QuestionAnswer:
         filters = intent.filters.to_metric_filters(intent.period)
-        frame = self.metric_service.service_by_dimension(
-            filters, "route", QuantityBasis.EACHES, limit=None
+        minimum_deliveries = 25
+        frame = self.metric_service.delivery_exceptions_by_dimension(
+            filters,
+            "route",
+            min_deliveries=minimum_deliveries,
+            limit=1_000,
         )
         qualifying = frame.loc[frame["late_over_2h_rate"] > intent.rate_threshold].sort_values(
             "late_over_2h_rate", ascending=False
@@ -1360,19 +1405,32 @@ class QuestionRouter:
             qualifying = qualifying.head(intent.limit)
         evidence = _frame_evidence(
             "Routes above the late-delivery threshold",
-            "fct_order_service",
+            "fct_delivery",
             qualifying,
         )
         if qualifying.empty:
-            summary = "No route exceeded the interpreted late-delivery threshold."
+            summary = (
+                "No route with at least "
+                f"{minimum_deliveries} actual-date deliveries exceeded the interpreted "
+                "late-delivery threshold."
+            )
         else:
             first = qualifying.iloc[0]
             summary = (
                 f"{len(qualifying)} route(s) exceeded the threshold; "
                 f"{first['dimension_value']} was highest at "
-                f"{_format_percent(first['late_over_2h_rate'])}."
+                f"{_format_percent(first['late_over_2h_rate'])} among groups with at least "
+                f"{minimum_deliveries} actual-date deliveries."
             )
-        return self._base_answer(intent, summary, (evidence,))
+        return self._base_answer(
+            intent,
+            summary,
+            (evidence,),
+            warnings=(
+                f"Routes below {minimum_deliveries} actual-date deliveries are excluded from "
+                "this ranking.",
+            ),
+        )
 
     def _discontinued(self, intent: QuestionIntent) -> QuestionAnswer:
         filters = intent.filters.to_metric_filters(intent.period)
@@ -1448,28 +1506,41 @@ class QuestionRouter:
                 sources=spec.sources,
                 intent=intent,
             )
-        if "freight_cost_per_delivered_case_inr" in frame:
+        settled_column = "settled_freight_cost_per_delivered_case_inr"
+        if settled_column in frame:
             frame = frame.sort_values(
-                "freight_cost_per_delivered_case_inr", ascending=False, na_position="last"
+                settled_column, ascending=False, na_position="last"
             )
         if intent.limit is not None:
             frame = frame.head(intent.limit)
         evidence = _frame_evidence(
-            "Billed freight per delivered case by " + ("route" if by_route else "warehouse"),
+            "Settled/paid freight per delivered case by "
+            + ("route" if by_route else "warehouse"),
             "partner freight invoices",
             frame,
         )
         if frame.empty:
             summary = "No freight and delivered-case evidence was found."
         else:
-            first = frame.iloc[0]
-            dimension_column = "route_code" if by_route else "warehouse_code"
-            summary = (
-                f"{first[dimension_column]} has the highest billed freight per delivered "
-                f"case at ₹{_format_number(first['freight_cost_per_delivered_case_inr'])}."
-            )
+            ranked = frame.dropna(subset=[settled_column])
+            if ranked.empty:
+                summary = "No settled/paid freight and delivered-case ratio was available."
+            else:
+                first = ranked.iloc[0]
+                dimension_column = "route_code" if by_route else "warehouse_code"
+                summary = (
+                    f"{first[dimension_column]} has the highest settled/paid freight per "
+                    f"delivered case at ₹{_format_number(first[settled_column])}."
+                )
         attribution = frame.attrs.get("attribution")
-        warnings = (str(attribution),) if attribution else ()
+        warnings_list = [str(attribution)] if attribution else []
+        ignored_filters = tuple(frame.attrs.get("ignored_filters", ()))
+        if ignored_filters:
+            warnings_list.append(
+                "Freight invoices and delivered-case denominators cannot apply the active "
+                "filter(s): " + ", ".join(str(value) for value in ignored_filters) + "."
+            )
+        warnings = tuple(warnings_list)
         return self._base_answer(intent, summary, (evidence,), warnings=warnings)
 
 

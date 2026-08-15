@@ -2,9 +2,12 @@
 
 from kestrel.ingestion.bazaarpulse import (
     BazaarPulseCollector,
+    BazaarPulseSnapshot,
     Listing,
     ProductCandidate,
     ProductMatch,
+    SourceDetailFailure,
+    SourcePriceObservation,
     match_listings_to_products,
 )
 from kestrel.ingestion.freight import (
@@ -17,6 +20,7 @@ from kestrel.ingestion.freight import (
 
 __all__ = [
     "BazaarPulseCollector",
+    "BazaarPulseSnapshot",
     "FreightClient",
     "FreightInvoice",
     "FreightSyncMetadata",
@@ -24,6 +28,8 @@ __all__ = [
     "Listing",
     "ProductCandidate",
     "ProductMatch",
+    "SourceDetailFailure",
+    "SourcePriceObservation",
     "match_listings_to_products",
     "load_last_good_cache",
 ]

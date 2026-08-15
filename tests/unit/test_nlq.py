@@ -112,6 +112,30 @@ class FakeMetricService:
             )
         raise AssertionError(f"Unexpected service dimension: {dimension}")
 
+    def delivery_exceptions_by_dimension(
+        self,
+        filters: FilterSet,
+        dimension: str,
+        *,
+        min_deliveries: int = 50,
+        limit: int = 30,
+    ) -> pd.DataFrame:
+        self.calls.append(
+            (
+                "delivery_exceptions_by_dimension",
+                (filters, dimension, min_deliveries, limit),
+            )
+        )
+        assert dimension == "route"
+        frame = pd.DataFrame(
+            {
+                "dimension_value": ["RT0001", "RT0002", "RT0003"],
+                "deliveries": [100, 25, 24],
+                "late_over_2h_rate": [0.05, 0.20, 1.0],
+            }
+        )
+        return frame.loc[frame["deliveries"] >= min_deliveries].head(limit)
+
     def service_trend(
         self, filters: FilterSet, basis: QuantityBasis = QuantityBasis.EACHES
     ) -> pd.DataFrame:
@@ -160,6 +184,16 @@ class FakeMetricService:
             }
         )
 
+    def credit_status_summary(self, filters: FilterSet) -> pd.DataFrame:
+        self.calls.append(("credit_status_summary", filters))
+        return pd.DataFrame(
+            {
+                "credit_note_status": ["APPROVED", "PENDING", "REJECTED"],
+                "credit_note_lines": [5, 2, 1],
+                "credit_note_value_inr": [12500.0, 3000.0, 800.0],
+            }
+        )
+
     def discontinued_order_evidence(self, filters: FilterSet, *, limit: int = 100) -> pd.DataFrame:
         self.calls.append(("discontinued_order_evidence", (filters, limit)))
         return pd.DataFrame(
@@ -199,6 +233,7 @@ class FakeExternalMetricService:
                 "warehouse_code": ["WH02", "WH01"],
                 "freight_cost_inr": [2000.0, 1000.0],
                 "delivered_case_equivalents": [50.0, 50.0],
+                "settled_freight_cost_per_delivered_case_inr": [25.0, 18.0],
                 "freight_cost_per_delivered_case_inr": [40.0, 20.0],
             }
         )
@@ -211,6 +246,7 @@ class FakeExternalMetricService:
                 "route_code": ["RT0002", "RT0001"],
                 "freight_cost_inr": [900.0, 600.0],
                 "delivered_case_equivalents": [30.0, 30.0],
+                "settled_freight_cost_per_delivered_case_inr": [20.0, 15.0],
                 "freight_cost_per_delivered_case_inr": [30.0, 20.0],
             }
         )
@@ -343,10 +379,17 @@ def test_return_question_calls_category_and_reason_allowlisted_methods() -> None
         DimensionKey.CATEGORY,
         DimensionKey.RETURN_REASON,
     )
-    assert len(answer.evidence) == 2
+    assert len(answer.evidence) == 3
     return_calls = [call for call in service.calls if call[0] == "returns_by_dimension"]
     assert [call[1][1] for call in return_calls] == ["category", "reason"]  # type: ignore[index]
     assert all(call[1][2] == ("APPROVED",) for call in return_calls)  # type: ignore[index]
+    assert answer.evidence[-1].title == "Credit-note workflow status"
+    assert {row[0] for row in answer.evidence[-1].rows} == {
+        "APPROVED",
+        "PENDING",
+        "REJECTED",
+    }
+    assert any(call[0] == "credit_status_summary" for call in service.calls)
 
 
 def test_chilled_excursions_by_month_calls_summary_for_each_q1_month() -> None:
@@ -383,6 +426,8 @@ def test_late_route_threshold_is_strictly_more_than_ten_percent() -> None:
     assert answer.intent.rate_threshold == 0.10
     assert len(answer.evidence[0].rows) == 1
     assert answer.evidence[0].rows[0][0] == "RT0002"
+    assert "at least 25 actual-date deliveries" in answer.summary
+    assert "RT0003" not in str(answer.evidence[0].rows)
 
 
 def test_market_price_question_is_typed_but_cleanly_requires_integration() -> None:
@@ -427,6 +472,7 @@ def test_optional_external_service_answers_price_and_freight_when_available() ->
     assert price.evidence[0].rows[0][0] == "SKU-1"
     assert freight.status == AnswerStatus.OK
     assert "WH02" in freight.summary
+    assert "settled/paid" in freight.summary
     assert "independently" in freight.warnings[0]
 
 
@@ -554,6 +600,8 @@ def test_ui_adapter_inherits_selected_scope_and_returns_transparent_payload() ->
         date(2026, 5, 1),
         date(2026, 5, 31),
         customer_regions=("West",),
+        promotion_codes=("PRM0001",),
+        order_sources=("SFA_MOBILE",),
     )
 
     payload = answer_question(
@@ -569,5 +617,7 @@ def test_ui_adapter_inherits_selected_scope_and_returns_transparent_payload() ->
     assert isinstance(metadata, dict)
     assert "Selected dashboard period (2026-05-01 to 2026-05-31)" in str(metadata["interpretation"])
     assert "quantity basis=case_equivalents" in str(metadata["interpretation"])
+    assert "promotion=PRM0001" in str(metadata["interpretation"])
+    assert "order source=SFA_MOBILE" in str(metadata["interpretation"])
     assert isinstance(payload["evidence"], list)
     assert payload["evidence"][0]["source"] == "fct_order_service"  # type: ignore[index]
