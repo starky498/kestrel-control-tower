@@ -77,12 +77,12 @@ a failure green; a threshold change is a requirement change and must be document
 | Visible heading | Every workspace | Passed: exact heading on all eight |
 | Streamlit exception/error | None | Passed: none reported |
 | Unlabelled interactive control | None | Passed: none reported |
-| Per-workspace render | ≤15,000 ms | Passed: slowest rerender 2,593.651 ms (Executive Command Center) |
+| Per-workspace render | ≤15,000 ms | Passed: slowest rerender 421.756 ms (Executive Command Center) |
 
-Evidence was recorded on 15 August 2026 against the final local release working tree after all 122
+Evidence was recorded on 15 August 2026 against the final local release working tree after all 239
 tests passed, with the full operational warehouse plus freight, market, weather, and holiday
-snapshots. Initial render was 6,937.851 ms; the eight-workspace audit passed 8/8 and the separate
-governed-question benchmark passed 8/8 with a slowest case of 1,064.450 ms. The ignored report path is
+snapshots. Initial render was 1,334.872 ms; the eight-workspace audit passed 8/8 and the separate
+governed-question benchmark passed 19/19 applicable cases with a slowest case of 297.479 ms. The ignored report path is
 `.kestrel/ui-audit.json`. A real Chrome visual check also found
 no horizontal document overflow at a 390 × 844 viewport. Keyboard-only operation, 200% zoom,
 contrast measurement, and screen-reader testing remain pending; no WCAG claim is made.
@@ -115,6 +115,8 @@ with a short note and the date/reviewer.
 - Confirm repeated sections and definition expanders have distinct, understandable labels.
 - Confirm Ask Kestrel exposes the interpreted definition and evidence and explains ambiguous or
   unsupported questions in plain language.
+- Confirm spelling repairs, local-semantic provenance/confidence, and fields inherited by a
+  follow-up are announced in text rather than conveyed only through color or hidden state.
 
 ### Color, contrast, and non-color cues
 
@@ -178,11 +180,14 @@ PYTHONPATH=src .venv/bin/python scripts/benchmark_qa.py \
   --output .kestrel/qa-benchmark.json
 ```
 
-Its eight cases cover a canonical and paraphrased outlet ranking, strict OTIF, ambiguous geography,
-an unsupported sentiment request, market price position, freight per case, and discontinued-SKU
-evidence. A case passes only when answer status and expected intent fields are correct and execution
-is no more than 5,000 ms. This checks a finite governed interface; it is not a claim that arbitrary
-natural-language questions are supported.
+Its baseline cases cover service, allocation, timing-cohort separation, backlog, inventory,
+commercial exposure, spelling repair, ambiguity, unsupported wording, and governed external
+evidence. When the optional local model installation passes its manifest checksum validation, two
+additional paraphrase cases run.
+A case passes only when answer status and expected intent fields are correct and execution is no
+more than 5,000 ms. This checks a finite governed interface; it is not a claim that arbitrary
+natural-language questions are supported. Without the model, the benchmark remains a valid
+rules-only gate; with it, the report states `local_semantic_model_enabled: true`.
 
 ## Failure triage
 

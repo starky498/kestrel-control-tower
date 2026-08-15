@@ -29,7 +29,7 @@ Status meanings:
 | Show an overall analysis with filters | Executive Command Center with global date, quantity, customer-region, DC-region, DC, route, outlet, channel, recorded order-source, and promotion scope | **Implemented.** `src/kestrel/ui/app.py`, `src/kestrel/ui/filters.py`, `src/kestrel/ui/pages.py`. |
 | Add profit/loss-style diagnostic pages | Reframed as Service, Delivery Exceptions, Cold/Inventory Risk, and Commercial Leakage/Logistics Cost | **Implemented.** Measured credit/short exposures, recorded dispositions, PAID settled freight primary, and billed/status evidence are shown. Accounting profit/recovery is a **boundary** because cost, collection, and settlement inputs are absent. |
 | Explain where service was gained/lost and what performed well | Three fulfilment gates, shortage contributors, worst groups, volume-qualified best and most-improved warehouses, delivery trends, exception rankings, and evidence | **Implemented.** Metric service, Executive/Service/Delivery pages, regression tests. “Driver” means association/contribution, not causal proof. |
-| Let managers ask natural questions | Deterministic typed intent router over the same metric services; ambiguity and unsupported requests fail safely | **Implemented.** `src/kestrel/nlq/router.py`, Ask Kestrel, NLQ tests. Unrestricted text-to-SQL is a **boundary**. |
+| Let managers ask natural questions | Rules-first typed intent routing over the same metric services, conservative business-term spelling repair, session-scoped follow-ups, and optional local MiniLM paraphrase matching; ambiguity and unsupported requests fail safely | **Implemented.** `src/kestrel/nlq/router.py`, local semantic/conversation modules, curated intent catalogue, Ask Kestrel, and NLQ tests. The model can select only a finite intent; unrestricted text-to-SQL is a **boundary**. |
 | Deliver a public repository with reviewable work | Repository includes source, locks, CI, container, README, concise decisions, requirements, architecture, runbook, demo, and trust docs; source/generated data are ignored | **Implemented.** Public URL and live CI are exposed through the README; final branch/commit status remains dynamic handoff evidence. |
 
 ## Source, semantic, and publication traceability
@@ -102,7 +102,7 @@ label their freshness.
 | Cold Chain & Inventory Risk | `UX-04`, `COLD-01`–`COLD-04` | Chilled excursion/severity trend, maximum temperature by warehouse/route/category, snapshot-relative near expiry/batch evidence, and exact RT06 return evidence |
 | Commercial Leakage & Logistics Cost | `UX-05`, `FIN-01`–`FIN-03`, `FRE-03`–`FRE-04` | Credit/short booked-value exposure, recorded disposition evidence, PAID settled primary, billed/status/route/carrier evidence, freshness and attribution |
 | Market & External Context | `UX-06`, `MKT-01`–`MKT-06`, `CTX-01`–`CTX-03` | Current and source-dated price position, retailer/listing/pack and 100G/100ML evidence, effective-dated MRP, service-price attention, review/history, gated associations |
-| Ask Kestrel | `UX-07`, `UX-09`, `MET-02` | Supported questions, explicit interpretation/definition/evidence, safe clarification/failure, guided diagnostics |
+| Ask Kestrel | `UX-07`, `UX-09`, `MET-02` | Supported dashboard metrics, exact-rules precedence, spelling support, local paraphrase matching when installed, session follow-ups, explicit interpretation/definition/evidence, and safe clarification/failure |
 | Trust Center | `UX-08`, `MET-01`, `OBS-01`–`OBS-02` | Registry/version, critical boundaries, dimension coverage, sync state/history, bounded operation events |
 
 The registry is defined in `src/kestrel/ui/app.py`. The release audit discovers these options rather
@@ -117,8 +117,11 @@ than hard-coding a second page list.
 | Parse quantity basis | Eaches/case-equivalents recognized; contradictory dual basis rejected | NLQ tests |
 | Parse dimensional filters | Allowlisted customer region, DC region, DC, route, outlet, channel and supported entities | Filter parsing tests |
 | Avoid geography ambiguity | Unqualified named region returns a customer-versus-DC clarification | Ambiguity regression test and Ask demonstration |
-| Prevent metric invention | Unsupported and multiple-metric questions fail with guidance | Finite `MetricName` and failure-path tests |
-| Prevent unsafe queries | No unrestricted SQL or generative fallback | Static typed route and parameterized service boundary |
+| Recognize paraphrases locally | Exact rules run first; an optional pinned MiniLM ONNX model maps similar wording only to the curated finite intent catalogue and must clear confidence/margin gates | Semantic resolver tests, checksum manifest, and `make setup-local-nlp`; no API key required |
+| Repair spelling conservatively | Corrections are bounded to known business vocabulary rather than silently rewriting outlet, route, warehouse, or other identifiers | Typo and unknown-entity regression tests |
+| Carry safe follow-up context | Session memory may inherit or replace only typed intent fields from the last successful question; ambiguous/failed follow-ups do not corrupt that context | Pure conversation-memory and UI orchestration tests |
+| Prevent metric invention | Unsupported, uncertain-semantic, and multiple-metric questions fail with guidance | Finite `MetricName`, semantic thresholds, and failure-path tests |
+| Prevent unsafe queries | No unrestricted SQL or generative answer fallback; the local model has no execution authority | Static typed route and parameterized service boundary |
 | Preserve evidence | Answer includes interpretation, definition/sources/warnings, and bounded supporting rows | Ask presentation layer and answer-contract tests |
 
 ## Reliability, observability, and deployment traceability
@@ -126,14 +129,15 @@ than hard-coding a second page list.
 | Plan / requirement | Artifact | Acceptance evidence | Status |
 |---|---|---|---|
 | One-command clean start (`REP-01`) | `Makefile`, `README.md` | `make start` creates env, doctor, validate, build, scrape, run | **Implemented; clean-checkout replay remains a handoff gate** |
+| Optional local intent setup | `Makefile`, `config/nlq_model.yml`, model downloader | `make setup-local-nlp` architecture-selects and SHA-256-verifies the public ONNX artifact under ignored `.kestrel/models/`; normal startup remains rules-only when absent | **Implemented; model download is optional and keyless** |
 | Version-pinned application/tool dependencies (`REP-02`) | `requirements.lock`, `requirements-dev.lock` | Docker and CI install locks then project `--no-deps`; base interpreter/build tooling is not bit-for-bit pinned | **Implemented** |
 | Local operation history (`OBS-01`) | `src/kestrel/observability.py`, CLI decorators | Paired STARTED + SUCCEEDED/FAILED JSONL for normal operations; successful cleanup clears prior logs and retains its final SUCCEEDED event | **Implemented; local doctor event verified** |
 | Secret redaction (`OBS-02`) | Recursive sensitive-key redactor | Observability unit tests; generated log ignored | **Implemented** |
 | Bounded destructive behavior (`REC-01`) | Per-target containment/symlink checks and `--yes` guard | Removes only validated DB/four caches/Parquet/log targets inside project `.kestrel`; external-file regression test | **Implemented** |
 | Non-root container (`DEP-01`) | `Dockerfile`, `compose.yaml`, entrypoint | Python 3.11, UID 10001, pinned application lock, port/health, read-only source, persisted runtime | **Implemented; Docker build is the remote CI acceptance gate** |
 | Continuous quality (`CI-01`) | `.github/workflows/ci.yml` | Read-only permission; pinned dependency install; Ruff, mypy, pytest; separate Docker build | **Implemented; live status is exposed by the README badge** |
-| UI regression/performance (`PERF-01`) | `scripts/audit_ui.py` | Eight discovered pages, heading/error/label checks, ≤15,000 ms, JSON | **Verified locally:** 8/8 passed; initial 6,937.851 ms; slowest rerender 2,593.651 ms (Executive Command Center) |
-| Governed-question regression/performance | `scripts/benchmark_qa.py` | Eight finite cases verify status/intent/result limit and ≤5,000 ms with required external snapshots | **Verified locally:** 8/8 passed; slowest case 1,064.450 ms |
+| UI regression/performance (`PERF-01`) | `scripts/audit_ui.py` | Eight discovered pages, heading/error/label checks, ≤15,000 ms, JSON | **Verified locally:** 8/8 passed; initial 1,334.872 ms; slowest rerender 421.756 ms (Executive Command Center) |
+| Governed-question regression/performance | `scripts/benchmark_qa.py` | Baseline finite cases plus two optional-model paraphrases verify status/intent/result limit and ≤5,000 ms with required external snapshots | **Verified locally:** 19/19 applicable cases passed with local model; slowest case 297.479 ms |
 | Manual accessibility (`A11Y-01`) | `docs/ACCESSIBILITY_PERFORMANCE.md` | Keyboard/focus/contrast/zoom/screen-reader record | **Pending manual verification; no WCAG claim** |
 
 ## Documentation and interview traceability
@@ -160,9 +164,9 @@ These rows prevent “implemented” from being mistaken for “release evidence
 |---|---|---|
 | Source/warehouse release | `make validate-data` and `make build`; manifest/source fingerprint reconciled | Passed locally: 93 checks, zero blocking; 818,901 raw rows; fingerprint recorded above |
 | Static quality | `make lint` and `git diff --check` | Passed locally: Ruff and mypy clean; diff check clean |
-| Full tests | `make test` | Passed locally: 123 tests |
-| Eight-page UI gate | `scripts/audit_ui.py --expected-pages 8 --threshold-ms 15000`; report `passed: true` and `page_count_passed: true` | Passed locally: 8/8; initial 6,937.851 ms; slowest 2,593.651 ms (Executive Command Center) |
-| Governed-question gate | `scripts/benchmark_qa.py --threshold-ms 5000`; report `passed: true` | Passed locally: 8/8; slowest 1,064.450 ms |
+| Full tests | `make test` | Passed locally: 239 tests |
+| Eight-page UI gate | `scripts/audit_ui.py --expected-pages 8 --threshold-ms 15000`; report `passed: true` and `page_count_passed: true` | Passed locally: 8/8; initial 1,334.872 ms; slowest 421.756 ms (Executive Command Center) |
+| Governed-question gate | `scripts/benchmark_qa.py --threshold-ms 5000`; report `passed: true` | Passed locally: 19/19 applicable cases with local model; slowest 297.479 ms |
 | Manual accessibility | Completed checklist with reviewer/environment | **Pending; no WCAG claim** |
 | Container | `docker build` and/or `docker compose up --build`, health check | Docker build delegated to remote CI; local Docker unavailable |
 | Repository safety | Clean/known status; no source DB/cache/secret/generated artifact tracked | Passed local tracked-file and secret scans; recheck after final commit |

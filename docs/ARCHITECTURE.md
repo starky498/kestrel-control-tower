@@ -58,7 +58,10 @@ flowchart TB
 
     PROMOTE --> METRIC["Allowlisted metric services\nand version 1.0.0 registry"]
     METRIC --> UI["Eight Streamlit workspaces"]
-    METRIC --> ASK["Governed Ask Kestrel router"]
+    RULES["Exact rules and conservative spelling"] --> ASK["Typed Ask Kestrel intent"]
+    LOCAL["Optional local MiniLM\nparaphrase matching"] -. "finite intent only" .-> ASK
+    MEMORY["Session follow-up context"] --> ASK
+    ASK --> METRIC
     EXT --> API["Read-only market review/history API"]
     CLI["Governed CLI operations"] --> LOG["Redacted JSONL run events"]
     LOG --> TRUST["Trust Center bounded event view"]
@@ -66,9 +69,10 @@ flowchart TB
     EXT --> TRUST
 ```
 
-The dashboard never contacts an external service on startup. External refreshes are explicit,
-independently failure-isolated operations. A missing optional cache degrades only the evidence that
-depends on it.
+The dashboard never contacts an external service or downloads a language model on startup.
+External refreshes and the optional local MiniLM installation are explicit, independently
+failure-isolated operations. A missing optional cache degrades only the evidence that depends on
+it; a missing MiniLM model leaves Ask Kestrel in rules-only mode.
 
 ## Eight decision workspaces
 
@@ -80,7 +84,7 @@ depends on it.
 | Cold Chain & Inventory Risk | Where chilled delivery severity and expiring/damaged/blocked batches concentrate | Distinct-delivery excursion grain and max-temperature evidence; latest eligible weekly batch snapshot |
 | Commercial Leakage & Logistics Cost | Which measured credits, short-delivery exposures, dispositions, and carrier invoices are material | PAID settled freight is primary; separate return, delivery, and invoice facts; not accounting profit or recovery |
 | Market & External Context | Where current/effective-dated MRP differs from current or source-dated governed shelf observations and optional context cohorts differ | Raw and 100G/100ML price evidence, high-confidence final matches, and publication-gated descriptive associations |
-| Ask Kestrel | Reusable management questions with evidence | Typed intent router calls the same metric services; no unrestricted SQL |
+| Ask Kestrel | Reusable management questions with evidence | Rules-first typed router, spelling support, session follow-ups, and optional local semantic intent matching call the same metric services; no unrestricted SQL or generated formulas |
 | Trust Center | Whether definitions, sources, syncs, and operations are trustworthy | Versioned registry, conflict evidence, freshness, sync history, bounded run events |
 
 ## Layer responsibilities
@@ -96,7 +100,9 @@ depends on it.
 5. **Metric services** use parameterized queries and allowlisted dimensions. The registry in
    `config/metrics.yml` supplies definition metadata and semantic versions.
 6. **Experience layers** render results and evidence. Streamlit pages and Ask Kestrel do not own or
-   duplicate formulas. The market API is read-only.
+   duplicate formulas. Ask Kestrel resolves exact rules first, may use a locally installed MiniLM
+   embedding model to map paraphrases into its finite intent catalogue, and carries only
+   allowlisted follow-up fields in Streamlit session state. The market API is read-only.
 7. **Observability** records local CLI start, success, and failure events with duration and a run ID.
    Sensitive-key fields are recursively redacted before append to JSONL.
 
@@ -185,6 +191,9 @@ invoice and delivered-case totals. Inventory is never reconstructed between week
   read-only.
 - API keys and local configuration are excluded. Docker receives the freight key through its
   environment rather than an image layer.
+- The optional Ask Kestrel model is a pinned, checksum-verified public ONNX artifact stored under
+  ignored `.kestrel/models/`. It requires no API key and performs local intent similarity only;
+  it receives no authority to issue SQL or alter metric definitions.
 - JSONL operation logs redact keys containing `api_key`, `password`, `secret`, `token`, or
   `credential`. The Trust Center displays only a bounded recent event set.
 - The container runs as a non-root user, mounts `data/source` read-only, installs the pinned runtime
@@ -196,7 +205,9 @@ invoice and delivered-case totals. Inventory is never reconstructed between week
 
 The supported evaluation modes are a Python 3.11 virtual environment and Docker Compose. CI uses
 the version-pinned development lock to run Ruff, mypy, and pytest, and separately builds the runtime
-image. The floating Python base tag and unpinned pip/setuptools remain environment-level limits.
+image. The optional local intent model is not committed or downloaded by `make start` or the
+container image; those paths retain a graceful rules-only fallback. The floating Python base tag
+and unpinned pip/setuptools remain environment-level limits.
 
 At roughly 100 times the supplied volume, the first constraints would be full single-node rebuilds,
 local file locking, synchronous UI queries, and scheduled external collection. Preserve the same

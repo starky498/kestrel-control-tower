@@ -31,9 +31,10 @@ logs, and audit outputs are deliberately excluded from Git.
 6. **Market & External Context** — current and source-dated BazaarPulse prices, retailer/listing
    evidence, governed matching, pack-normalized 100G/100ML comparisons, effective-dated historical
    Kestrel MRP, service-price attention, and gated weather/holiday associations.
-7. **Ask Kestrel** — a deterministic typed intent router calling the same metric services as the
-   dashboard, including actual-date/25-delivery late-route evidence and APPROVED-return rankings
-   with PENDING/REJECTED workflow context; no unrestricted text-to-SQL.
+7. **Ask Kestrel** — a rules-first, typed intent router with conservative spelling repair,
+   session-scoped follow-up memory, and optional keyless local MiniLM paraphrase matching. Every
+   accepted intent still calls the same allowlisted metric services as the dashboard; the local
+   model cannot write SQL, change a formula, or generate an unrestricted answer.
 8. **Trust Center** — versioned definitions, data conflicts, freshness, sync history, and bounded
    redacted operation events.
 
@@ -92,6 +93,47 @@ make run
 lint, typing, test, coverage, and HTTP-mocking tools. They do not digest-pin the Python base image or
 pin pip/setuptools, so this is dependency-version reproducibility rather than a bit-for-bit
 environment guarantee.
+
+### Optional local language understanding
+
+Ask Kestrel works immediately in rules-only mode. To recognize a wider range of paraphrases, each
+person who clones the repository can optionally run:
+
+```bash
+make setup-local-nlp
+```
+
+The same verified installation is available from the **Install local language model** button on
+the Ask Kestrel page.
+
+This downloads the pinned, SHA-256-verified `sentence-transformers/all-MiniLM-L6-v2` ONNX model
+(`Apache-2.0`, recorded in the manifest) into the ignored `.kestrel/models/` directory. The
+architecture-specific download is approximately
+23 MB on common ARM64 and x86-64 computers (the portable fallback is approximately 46 MB). It needs
+no API key, paid account, or secret. The one-time download uses the public model host; inference is
+then local, and questions are not sent to an external AI service.
+
+The ONNX/tokenizer Python runtime is installed with the normal project dependencies and used about
+100 MB in the tested macOS virtual environment; exact installed size varies by operating system.
+The separately downloaded model is the approximately 23 MB component described above.
+
+The model has a deliberately narrow role: it maps a paraphrase to one of Kestrel's finite supported
+metric intents. Exact rules run first, confidence and ambiguity gates can refuse uncertain matches,
+and all calculations remain deterministic, parameterized calls to governed metric services.
+Spelling repair is limited to business vocabulary, and short follow-up questions inherit only
+allowlisted session context. Neither feature enables arbitrary questions or unrestricted
+text-to-SQL.
+
+The model binary is intentionally not committed, so another person cloning the repository must run
+`make setup-local-nlp` to enable semantic paraphrases. If they skip it, are offline, or set
+`KESTREL_NLQ_SEMANTIC_ENABLED=false` in local `.env`, the dashboard continues with its governed
+rules, spelling support, and safe unsupported-question response. `make start` never downloads the
+model or makes network access a startup dependency.
+
+The installer follows `KESTREL_NLQ_MODEL_PATH` when configured; otherwise it uses the model
+directory below `KESTREL_RUNTIME_DIR`. Keep a custom in-repository model path under `.kestrel/`, or
+add that exact directory to the checkout's local `.git/info/exclude`. Only the default `.kestrel/`
+location is automatically excluded by the committed `.gitignore`.
 
 ## Optional external evidence
 
@@ -174,6 +216,7 @@ See [docs/COMPETITOR_MATCH_GOVERNANCE.md](docs/COMPETITOR_MATCH_GOVERNANCE.md).
 
 ```bash
 make prepare          # doctor + validation + staged build + BazaarPulse snapshot
+make setup-local-nlp  # optional keyless, verified ~23 MB local paraphrase model
 make validate-data    # 93 schema, grain, FK, parity, and conflict checks
 make build            # staged SQLite -> DuckDB + Parquet manifest with rollback
 make scrape-prices    # allowed local scrape, matching, overrides, current + history
@@ -183,7 +226,7 @@ make run              # start Streamlit without rebuilding
 make test             # deterministic test suite
 make lint             # Ruff + mypy
 make audit            # eight-workspace label/error/control/15s audit
-make benchmark        # eight governed-question cases; external snapshots required
+make benchmark        # 17 baseline cases; 19 with a verified model; external snapshots required
 make quality          # lint + test + audit + governed-question benchmark
 make clean            # confirmation guard; no deletion without the explicit --yes command
 ```
@@ -199,10 +242,11 @@ PYTHONPATH=src .venv/bin/python scripts/audit_ui.py \
 
 The audit fails unless exactly eight workspaces are discovered. Each must render in no more than
 15,000 ms with a visible heading, no Streamlit exception/error, and no unlabelled interactive
-control. The 15 August 2026 local release run passed 123 tests and all eight workspaces: no
-exceptions, errors, missing headings, or unlabelled controls; initial render was 6,937.851 ms and
-the slowest measured page rerender was Executive Command Center at 2,593.651 ms. The governed-question
-benchmark also passed all eight cases, with its slowest case at 1,064.450 ms. Generated
+control. The 15 August 2026 local release run passed 239 tests and all eight workspaces: no
+exceptions, errors, missing headings, or unlabelled controls; initial render was 1,334.872 ms and
+the slowest measured page rerender was Executive Command Center at 421.756 ms. The governed-question
+benchmark also passed all 19 applicable cases, including two installed-model paraphrases, with its
+slowest case at 297.479 ms. Generated
 JSON evidence remains ignored and should be refreshed on the review machine. This automated audit
 does not establish WCAG conformance; manual keyboard, focus, contrast, zoom, and screen-reader
 checks remain pending and separate.
@@ -218,8 +262,9 @@ docker compose up --build
 ```
 
 The entrypoint validates/builds/scrapes only when the analytical database is absent. Freight and
-public context remain explicit optional syncs. See [docs/RUNBOOK.md](docs/RUNBOOK.md) for container
-and recovery procedures.
+public context remain explicit optional syncs. The image does not download the optional MiniLM
+model, so its default Ask Kestrel behavior is the rules-only fallback. See
+[docs/RUNBOOK.md](docs/RUNBOOK.md) for container and recovery procedures.
 
 ## Metric and trust stance
 
@@ -271,6 +316,9 @@ outside Git.
 - **Context unavailable:** rerun `make sync-context`, or publish valid last-good caches offline.
 - **Market snapshot unavailable:** verify `bazaarpulse_site/`, decision YAML, then rerun
   `make scrape-prices`.
+- **Local NLP model unavailable:** Ask Kestrel continues in rules-only mode. When network access is
+  available, rerun `make setup-local-nlp`; the installer reuses already verified files and rejects
+  a wrong size or checksum.
 - **Rebuild recovery:** staged writes prevent partial individual artifacts, and handled DB-promotion
   failure restores the prior Parquet directory. After a host/process interruption, compare the
   manifest fingerprint and rerun the build. See the runbook before deleting generated state.

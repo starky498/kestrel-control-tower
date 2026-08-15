@@ -25,6 +25,13 @@ or stale build, but should not be recited without verifying the page scope.
    make test
    ```
 
+   If the demonstration will include local paraphrase matching, install its optional public model
+   once. This is not a core-app or release precondition:
+
+   ```bash
+   make setup-local-nlp
+   ```
+
 4. With the supplied freight mock server running and its key in local `.env`, refresh freight and
    context before the benchmark or if those evidence tracks will be shown:
 
@@ -241,6 +248,22 @@ What was fill rate in the West customer region?
 What was fill rate in the West DC region?
 ```
 
+Show a conservative spelling repair and a session-scoped follow-up:
+
+```text
+Which five outltes had the lowest case fill rte?
+What about the North customer region?
+```
+
+The follow-up may inherit only the preceding supported metric fields and should expose that
+inheritance in its interpretation. A failed or ambiguous follow-up must leave the last successful
+context unchanged. If `make setup-local-nlp` was run, also show a wording that does not contain the
+canonical metric phrase:
+
+```text
+Where are customers receiving the smallest share of what they asked for?
+```
+
 Then show the repaired evidence boundaries:
 
 ```text
@@ -250,13 +273,17 @@ Which categories drive the largest value of returns, and what is the leading rea
 
 Narrative:
 
-- This is a deterministic allowlisted intent router, not a general chatbot.
-- It calls the same metric services as the pages and cannot execute unrestricted model-generated
-  SQL.
+- This is a rules-first, finite-intent question interface, not a general chatbot. Exact rules,
+  spelling repair, and follow-up memory operate locally.
+- The optional MiniLM embedding model is keyless and local. It only maps paraphrases to a supported
+  intent, with confidence and ambiguity gates; it does not generate the answer.
+- Every accepted question calls the same deterministic metric services as the pages and cannot
+  execute unrestricted model-generated SQL or change a governed formula.
 - The late-route answer uses actual delivery date and excludes routes below 25 deliveries. The
   return answer ranks only APPROVED value and appends PENDING/REJECTED workflow-status evidence.
-- Unsupported, multi-metric, contradictory-basis, or ambiguous-geography questions fail safely and
-  offer guidance.
+- A missing model falls back gracefully to exact rules. Unsupported, uncertain-semantic,
+  multi-metric, contradictory-basis, or ambiguous-geography questions fail safely and offer
+  guidance.
 
 ## 8. Trust Center — 1.5 minutes
 
