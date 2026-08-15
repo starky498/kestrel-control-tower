@@ -1,0 +1,38 @@
+# Supplied and generated data
+data/source/
+data/raw/
+data/processed/
+data/cache/
+data/*.db
+data/*.sqlite*
+*.db
+*.sqlite*
+*.parquet
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE and operating-system files
+.DS_Store
+.idea/
+.vscode/
+
+# Generated application artifacts
+.kestrel/
+artifacts/
+outputs/
+*.log
