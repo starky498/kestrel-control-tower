@@ -3,12 +3,25 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import typer
 
 from kestrel.config import ConfigurationError, Settings
 from kestrel.contracts import validate_source
+from kestrel.ingestion.bazaarpulse import (
+    BazaarPulseCollector,
+    HttpSiteSource,
+    match_listings_to_products,
+)
+from kestrel.ingestion.freight import FreightClient
+from kestrel.integration_store import (
+    load_product_candidates,
+    store_bazaarpulse_snapshot,
+    store_freight_snapshot,
+)
 from kestrel.warehouse import build_warehouse
 
 app = typer.Typer(no_args_is_help=True, help="Kestrel control-tower operations.")
@@ -76,6 +89,149 @@ def build() -> None:
     for table, count in summary.model_rows.items():
         typer.echo(f"{table}: {count:,}")
     typer.echo(f"Source SHA-256: {summary.source_sha256}")
+
+
+@app.command("scrape-prices")
+def scrape_prices(
+    use_http: bool = typer.Option(
+        False,
+        "--http",
+        help="Use the configured local HTTP server even when the unpacked site is available.",
+    ),
+) -> None:
+    """Collect allowed BazaarPulse pages, match conservatively, and publish a snapshot."""
+
+    settings = _settings()
+    try:
+        analytics_db = settings.require_analytics_db()
+    except ConfigurationError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=2) from error
+
+    settings.ensure_runtime_dirs()
+    started = datetime.now(UTC)
+    if settings.bazaarpulse_site_root is not None and not use_http:
+        collector = BazaarPulseCollector.from_local(
+            settings.bazaarpulse_site_root,
+            cache_path=settings.competitor_cache,
+        )
+        source_description = str(settings.bazaarpulse_site_root)
+    else:
+        collector = BazaarPulseCollector.from_http(
+            settings.bazaarpulse_base_url,
+            cache_path=settings.competitor_cache,
+        )
+        source_description = settings.bazaarpulse_base_url
+
+    try:
+        listings = collector.collect()
+    except Exception as error:
+        typer.echo(
+            f"BazaarPulse refresh failed; the last-good cache and warehouse snapshot were "
+            f"preserved: {error}",
+            err=True,
+        )
+        raise typer.Exit(code=1) from error
+    finally:
+        if isinstance(collector.source, HttpSiteSource):
+            collector.source.close()
+
+    products = load_product_candidates(analytics_db)
+    threshold = settings.competitor_match_threshold / 100
+    matches = match_listings_to_products(
+        listings,
+        products,
+        minimum_confidence=threshold,
+    )
+    summary = store_bazaarpulse_snapshot(
+        analytics_db,
+        listings,
+        matches,
+        started_at_utc=started,
+    )
+    statuses = Counter(match.status for match in matches)
+    typer.echo(f"Collected {summary.record_count:,} unique listings from {source_description}")
+    typer.echo(
+        "Match outcomes: "
+        + ", ".join(f"{status}={count:,}" for status, count in sorted(statuses.items()))
+    )
+    typer.echo(
+        f"Observation coverage: {summary.coverage_start} to {summary.coverage_end}; "
+        f"cache={settings.competitor_cache}"
+    )
+
+
+@app.command("sync-freight")
+def sync_freight(
+    date_from: str = typer.Option(
+        "2026-04-01",
+        "--from",
+        help="Inclusive invoice date (YYYY-MM-DD); defaults to FY 2026-27 Q1.",
+    ),
+    date_to: str = typer.Option(
+        "2026-06-30",
+        "--to",
+        help="Inclusive invoice date (YYYY-MM-DD); defaults to FY 2026-27 Q1.",
+    ),
+    resume: bool = typer.Option(
+        True,
+        "--resume/--no-resume",
+        help="Resume a compatible interrupted cursor walk.",
+    ),
+) -> None:
+    """Synchronize carrier invoices with retry, resume, and last-good protection."""
+
+    settings = _settings()
+    try:
+        analytics_db = settings.require_analytics_db()
+        parsed_from = date.fromisoformat(date_from)
+        parsed_to = date.fromisoformat(date_to)
+    except (ConfigurationError, ValueError) as error:
+        typer.echo(f"Invalid freight sync configuration: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    if not settings.freight_api_key:
+        typer.echo(
+            "KESTREL_FREIGHT_API_KEY is not configured. Copy the supplied mock-server key "
+            "into your local .env; never commit it.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    settings.ensure_runtime_dirs()
+    with FreightClient(
+        base_url=settings.freight_api_url,
+        api_key=settings.freight_api_key,
+        cache_path=settings.freight_cache,
+    ) as client:
+        result = client.sync(
+            date_from=parsed_from,
+            date_to=parsed_to,
+            resume=resume,
+        )
+
+    if not result.complete:
+        typer.echo(
+            f"Freight sync incomplete after {result.metadata.page_count:,} pages and "
+            f"{result.metadata.retry_count:,} retries: {result.metadata.error}",
+            err=True,
+        )
+        typer.echo(
+            "Cursor checkpoint saved; the previous last-good cache and analytical snapshot "
+            "were preserved.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    summary = store_freight_snapshot(analytics_db, result.invoices, result.metadata)
+    typer.echo(
+        f"Published {summary.record_count:,} freight invoices after "
+        f"{result.metadata.page_count:,} pages, {result.metadata.request_count:,} requests, "
+        f"and {result.metadata.retry_count:,} retries."
+    )
+    typer.echo(
+        f"Service-date coverage: {summary.coverage_start} to {summary.coverage_end}; "
+        f"cache={settings.freight_cache}"
+    )
 
 
 @app.command("clean-generated")
